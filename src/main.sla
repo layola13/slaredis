@@ -1,0 +1,67 @@
+// main.sla -- slaredis entry point.
+//
+// Configuration is environment-only (no config file in M0):
+//   SLAREDIS_HOST  bind address, default "127.0.0.1" (loopback-only
+//                  unless explicitly configured otherwise)
+//   SLAREDIS_PORT  port, default 6379; must be 1..65535
+// Exit codes: 0 never returns (server loop); 64 invalid
+// SLAREDIS_PORT; 65 invalid SLAREDIS_HOST; 66 listen failed;
+// 67 listener setup failed.
+@import "sa_std/env.sai"
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+@import "store.sla"
+@import "server.sla"
+
+struct EnvValue { present: bool, value: Vec<u8> }
+
+// Read an environment variable into bytes.
+// (A struct return, not a tuple: tuple types containing a generic
+// type fail to parse in this toolchain — tuple returns of pure
+// primitives elsewhere in this codebase are unaffected.)
+fn env_value(name: ptr, name_len: u64) -> EnvValue {
+    let h: u64 = sa_env_get(name, name_len);
+    if h == 0 {
+        return EnvValue { present: false, value: Vec::new() };
+    };
+    let data: ptr = sa_env_buffer_data(h);
+    let n: u64 = sa_env_buffer_len(h);
+    let out: Vec<u8> = Vec::new();
+    let i: u64 = 0;
+    while i < n {
+        out.push(PTR_BYTE_AT(data, i));
+        i = i + 1;
+    }
+    let freed: i32 = sa_env_buffer_free(h);
+    return EnvValue { present: true, value: out };
+}
+
+fn lit_bytes(lit: ptr, lit_len: u64) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    return bytes_push_lit(out, lit, lit_len);
+}
+
+fn main() -> i32 {
+    let host: Vec<u8> = lit_bytes(STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"));
+    let host_env = env_value(STR_PTR("SLAREDIS_HOST"), STR_LEN("SLAREDIS_HOST"));
+    if host_env.present {
+        if len(host_env.value) == 0 || len(host_env.value) > 63 {
+            return 65;
+        };
+        host = host_env.value;
+    };
+    let port: u32 = 6379;
+    let port_env = env_value(STR_PTR("SLAREDIS_PORT"), STR_LEN("SLAREDIS_PORT"));
+    if port_env.present {
+        let (ok, v) = parse_i64_full(&port_env.value);
+        if ok != true || v < 1 || v > 65535 {
+            return 64;
+        };
+        port = v as u32;
+    };
+    let store = store_new();
+    return run_server(&store, host, port);
+}

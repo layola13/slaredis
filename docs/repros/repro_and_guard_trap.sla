@@ -1,0 +1,9 @@
+// REPRO / LANGUAGE GOTCHA: && and || do not short-circuit in SLA.
+// The right-hand side of `p < n && a[p] == 46` is evaluated even
+// when p == n, so the index traps at runtime (PANIC: code=32,
+// process exit 160). Expected if && short-circuited: return 0.
+// slaredis rule: a bounds check never guards an index across
+// && / ||; nested ifs are used instead (see parse_f64_full).
+@import "sa_std/vec.sa"
+fn probe(a: &Vec<u8>) -> bool { let p: u64 = 1; let n: u64 = len(a); if p < n && a[p] == 46 { return true; }; return false; }
+fn main() -> i32 { let v: Vec<u8> = Vec::new(); v.push(50); if probe(&v) { return 1; }; return 0; }

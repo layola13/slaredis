@@ -1,0 +1,1073 @@
+// commands.sla -- command dispatch and implementations (M0 set).
+//
+// Every handler takes the reply buffer by value and returns it
+// (value-threaded, see resp.sla), appending exactly one RESP
+// reply. Errors use the Redis wire forms: WRONGTYPE for kind
+// mismatches, ERR with the canonical lowercase command name for
+// arity, the not-an-integer / overflow / syntax / invalid-float
+// texts Redis uses. Deviations from full Redis semantics are
+// recorded in docs/M0_DELIVERY.md.
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+@import "store.sla"
+@import "resp.sla"
+
+// ---- shared error + lookup helpers ----
+
+fn err_wrongtype(out: Vec<u8>) -> Vec<u8> {
+    return resp_error(out, STR_PTR("WRONGTYPE Operation against a key holding the wrong kind of value"), STR_LEN("WRONGTYPE Operation against a key holding the wrong kind of value"));
+}
+
+fn err_arity(out: Vec<u8>, name: ptr, name_len: u64) -> Vec<u8> {
+    out.push(45);
+    out = bytes_push_lit(out, STR_PTR("ERR wrong number of arguments for '"), STR_LEN("ERR wrong number of arguments for '"));
+    out = bytes_push_lit(out, name, name_len);
+    out = bytes_push_lit(out, STR_PTR("' command"), STR_LEN("' command"));
+    out.push(13);
+    out.push(10);
+    return out;
+}
+
+fn err_unknown(out: Vec<u8>, arg0: &Vec<u8>) -> Vec<u8> {
+    out.push(45);
+    out = bytes_push_lit(out, STR_PTR("ERR unknown command '"), STR_LEN("ERR unknown command '"));
+    out = bytes_push_range(out, arg0, 0, len(arg0));
+    out = bytes_push_lit(out, STR_PTR("'"), STR_LEN("'"));
+    out.push(13);
+    out.push(10);
+    return out;
+}
+
+fn err_not_int(out: Vec<u8>) -> Vec<u8> {
+    return resp_error(out, STR_PTR("ERR value is not an integer or out of range"), STR_LEN("ERR value is not an integer or out of range"));
+}
+
+fn err_overflow(out: Vec<u8>) -> Vec<u8> {
+    return resp_error(out, STR_PTR("ERR increment or decrement would overflow"), STR_LEN("ERR increment or decrement would overflow"));
+}
+
+fn err_syntax(out: Vec<u8>) -> Vec<u8> {
+    return resp_error(out, STR_PTR("ERR syntax error"), STR_LEN("ERR syntax error"));
+}
+
+fn err_float(out: Vec<u8>) -> Vec<u8> {
+    return resp_error(out, STR_PTR("ERR value is not a valid float"), STR_LEN("ERR value is not a valid float"));
+}
+
+fn err_invalid_expire_set(out: Vec<u8>) -> Vec<u8> {
+    return resp_error(out, STR_PTR("ERR invalid expire time in 'set' command"), STR_LEN("ERR invalid expire time in 'set' command"));
+}
+
+// Find a live entry of exactly `kind`: index >= 0 hit, -1 missing,
+// -2 present with a different kind (caller replies WRONGTYPE).
+fn lookup_typed(s: &Store, key: &Vec<u8>, kind: u8, now_ms: i64) -> i64 {
+    let idx: i64 = store_find(s, key, bytes_hash(key), now_ms);
+    if idx < 0 {
+        return -1;
+    };
+    if s.entries[idx as u64].kind != kind {
+        return -2;
+    };
+    return idx;
+}
+
+// lookup_typed plus creation of a missing key with the given kind.
+fn lookup_or_create(s: &Store, key: &Vec<u8>, kind: u8, now_ms: i64) -> i64 {
+    let idx: i64 = lookup_typed(s, key, kind, now_ms);
+    if idx != -1 {
+        return idx;
+    };
+    return store_insert(s, key, bytes_hash(key), kind);
+}
+
+// Saturating now + delta_ms for expiry deadlines.
+fn expire_deadline(now_ms: i64, delta_ms: i64) -> i64 {
+    if delta_ms > 0 {
+        if now_ms > 9223372036854775807 - delta_ms {
+            return 9223372036854775807;
+        };
+    };
+    return now_ms + delta_ms;
+}
+
+// ---- generic commands ----
+
+fn cmd_ping(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) == 1 {
+        return resp_simple(out, STR_PTR("PONG"), STR_LEN("PONG"));
+    };
+    if len(args) == 2 {
+        return resp_bulk(out, &args[1]);
+    };
+    return err_arity(out, STR_PTR("ping"), STR_LEN("ping"));
+}
+
+fn cmd_echo(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("echo"), STR_LEN("echo"));
+    };
+    return resp_bulk(out, &args[1]);
+}
+
+fn cmd_set(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 3 {
+        return err_arity(out, STR_PTR("set"), STR_LEN("set"));
+    };
+    let deadline: i64 = 0;
+    let i: u64 = 3;
+    while i < len(args) {
+        if bytes_eq_lit_ci(&args[i], STR_PTR("EX"), STR_LEN("EX")) {
+            if deadline != 0 {
+                return err_syntax(out);
+            };
+            if i + 1 >= len(args) {
+                return err_syntax(out);
+            };
+            let (ok, sec) = parse_i64_full(&args[i + 1]);
+            if ok != true || sec <= 0 {
+                return err_invalid_expire_set(out);
+            };
+            if sec > 9223372036854775807 / 1000 {
+                deadline = 9223372036854775807;
+            } else {
+                deadline = expire_deadline(now_ms, sec * 1000);
+            };
+            i = i + 2;
+        } else {
+            if bytes_eq_lit_ci(&args[i], STR_PTR("PX"), STR_LEN("PX")) {
+                if deadline != 0 {
+                    return err_syntax(out);
+                };
+                if i + 1 >= len(args) {
+                    return err_syntax(out);
+                };
+                let (ok2, ms) = parse_i64_full(&args[i + 1]);
+                if ok2 != true || ms <= 0 {
+                    return err_invalid_expire_set(out);
+                };
+                deadline = expire_deadline(now_ms, ms);
+                i = i + 2;
+            } else {
+                return err_syntax(out);
+            };
+        };
+    }
+    let idx: i64 = store_find(s, &args[1], bytes_hash(&args[1]), now_ms);
+    let slot: u64 = 0;
+    if idx >= 0 {
+        slot = idx as u64;
+        entry_reset(s, slot, KIND_STRING);
+    } else {
+        slot = store_insert(s, &args[1], bytes_hash(&args[1]), KIND_STRING) as u64;
+    };
+    s.entries[slot].sval = bytes_clone(&args[2]);
+    s.entries[slot].expire_ms = deadline;
+    return resp_simple(out, STR_PTR("OK"), STR_LEN("OK"));
+}
+
+fn cmd_get(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("get"), STR_LEN("get"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_STRING, now_ms);
+    if idx == -1 {
+        return resp_nil(out);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    return resp_bulk(out, &s.entries[idx as u64].sval);
+}
+
+fn cmd_del(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 2 {
+        return err_arity(out, STR_PTR("del"), STR_LEN("del"));
+    };
+    let removed: i64 = 0;
+    let i: u64 = 1;
+    while i < len(args) {
+        let idx: i64 = store_find(s, &args[i], bytes_hash(&args[i]), now_ms);
+        if idx >= 0 {
+            entry_tombstone(s, idx as u64);
+            removed = removed + 1;
+        };
+        i = i + 1;
+    }
+    return resp_int(out, removed);
+}
+
+fn cmd_exists(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 2 {
+        return err_arity(out, STR_PTR("exists"), STR_LEN("exists"));
+    };
+    let count: i64 = 0;
+    let i: u64 = 1;
+    while i < len(args) {
+        let idx: i64 = store_find(s, &args[i], bytes_hash(&args[i]), now_ms);
+        if idx >= 0 {
+            count = count + 1;
+        };
+        i = i + 1;
+    }
+    return resp_int(out, count);
+}
+
+fn cmd_type(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("type"), STR_LEN("type"));
+    };
+    let idx: i64 = store_find(s, &args[1], bytes_hash(&args[1]), now_ms);
+    if idx < 0 {
+        return resp_simple(out, STR_PTR("none"), STR_LEN("none"));
+    };
+    let kind: u8 = s.entries[idx as u64].kind;
+    if kind == KIND_STRING {
+        return resp_simple(out, STR_PTR("string"), STR_LEN("string"));
+    };
+    if kind == KIND_HASH {
+        return resp_simple(out, STR_PTR("hash"), STR_LEN("hash"));
+    };
+    if kind == KIND_LIST {
+        return resp_simple(out, STR_PTR("list"), STR_LEN("list"));
+    };
+    if kind == KIND_SET {
+        return resp_simple(out, STR_PTR("set"), STR_LEN("set"));
+    };
+    return resp_simple(out, STR_PTR("zset"), STR_LEN("zset"));
+}
+
+fn incr_by(s: &Store, key: &Vec<u8>, delta: i64, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    let idx0: i64 = store_find(s, key, bytes_hash(key), now_ms);
+    if idx0 >= 0 {
+        if s.entries[idx0 as u64].kind != KIND_STRING {
+            return err_wrongtype(out);
+        };
+    };
+    let cur: i64 = 0;
+    if idx0 >= 0 {
+        let (ok, v) = parse_i64_full(&s.entries[idx0 as u64].sval);
+        if ok != true {
+            return err_not_int(out);
+        };
+        cur = v;
+    };
+    if delta > 0 {
+        if cur == 9223372036854775807 {
+            return err_overflow(out);
+        };
+    } else {
+        if cur == 0 - 9223372036854775807 - 1 {
+            return err_overflow(out);
+        };
+    };
+    let nv: i64 = cur + delta;
+    let slot: u64 = 0;
+    if idx0 >= 0 {
+        slot = idx0 as u64;
+    } else {
+        slot = store_insert(s, key, bytes_hash(key), KIND_STRING) as u64;
+    };
+    let text: Vec<u8> = Vec::new();
+    let text2 = append_i64(text, nv);
+    s.entries[slot].sval = text2;
+    return resp_int(out, nv);
+}
+
+fn cmd_incr(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("incr"), STR_LEN("incr"));
+    };
+    return incr_by(s, &args[1], 1, now_ms, out);
+}
+
+fn cmd_decr(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("decr"), STR_LEN("decr"));
+    };
+    return incr_by(s, &args[1], 0 - 1, now_ms, out);
+}
+
+fn cmd_expire(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 3 {
+        return err_arity(out, STR_PTR("expire"), STR_LEN("expire"));
+    };
+    let (ok, sec) = parse_i64_full(&args[2]);
+    if ok != true {
+        return err_not_int(out);
+    };
+    let idx: i64 = store_find(s, &args[1], bytes_hash(&args[1]), now_ms);
+    if idx < 0 {
+        return resp_int(out, 0);
+    };
+    if sec <= 0 {
+        entry_tombstone(s, idx as u64);
+        return resp_int(out, 1);
+    };
+    if sec > 9223372036854775807 / 1000 {
+        s.entries[idx as u64].expire_ms = 9223372036854775807;
+    } else {
+        s.entries[idx as u64].expire_ms = expire_deadline(now_ms, sec * 1000);
+    };
+    return resp_int(out, 1);
+}
+
+// Shared TTL/PTTL body: -2 missing, -1 no expiry, else remaining.
+fn ttl_common(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>, in_ms: bool) -> Vec<u8> {
+    let idx: i64 = store_find(s, &args[1], bytes_hash(&args[1]), now_ms);
+    if idx < 0 {
+        return resp_int(out, 0 - 2);
+    };
+    let exp: i64 = s.entries[idx as u64].expire_ms;
+    if exp == 0 {
+        return resp_int(out, 0 - 1);
+    };
+    let remaining: i64 = exp - now_ms;
+    if in_ms {
+        return resp_int(out, remaining);
+    };
+    return resp_int(out, (remaining + 500) / 1000);
+}
+
+fn cmd_ttl(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("ttl"), STR_LEN("ttl"));
+    };
+    return ttl_common(s, args, now_ms, out, false);
+}
+
+fn cmd_pttl(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("pttl"), STR_LEN("pttl"));
+    };
+    return ttl_common(s, args, now_ms, out, true);
+}
+
+fn cmd_persist(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("persist"), STR_LEN("persist"));
+    };
+    let idx: i64 = store_find(s, &args[1], bytes_hash(&args[1]), now_ms);
+    if idx < 0 {
+        return resp_int(out, 0);
+    };
+    if s.entries[idx as u64].expire_ms == 0 {
+        return resp_int(out, 0);
+    };
+    s.entries[idx as u64].expire_ms = 0;
+    return resp_int(out, 1);
+}
+
+// ---- hash commands ----
+
+fn hash_field_index(s: &Store, e: u64, field: &Vec<u8>) -> i64 {
+    let i: u64 = 0;
+    while i < len(s.entries[e].hfields) {
+        if bytes_eq(&s.entries[e].hfields[i], field) {
+            return i as i64;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn cmd_hset(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 4 || len(args) % 2 != 0 {
+        return err_arity(out, STR_PTR("hset"), STR_LEN("hset"));
+    };
+    let idx: i64 = lookup_or_create(s, &args[1], KIND_HASH, now_ms);
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let added: i64 = 0;
+    let i: u64 = 2;
+    while i < len(args) {
+        let fi: i64 = hash_field_index(s, e, &args[i]);
+        if fi >= 0 {
+            s.entries[e].hvalues[fi as u64] = bytes_clone(&args[i + 1]);
+        } else {
+            s.entries[e].hfields.push(bytes_clone(&args[i]));
+            s.entries[e].hvalues.push(bytes_clone(&args[i + 1]));
+            added = added + 1;
+        };
+        i = i + 2;
+    }
+    return resp_int(out, added);
+}
+
+fn cmd_hget(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 3 {
+        return err_arity(out, STR_PTR("hget"), STR_LEN("hget"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_HASH, now_ms);
+    if idx == -1 {
+        return resp_nil(out);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let fi: i64 = hash_field_index(s, idx as u64, &args[2]);
+    if fi < 0 {
+        return resp_nil(out);
+    };
+    return resp_bulk(out, &s.entries[idx as u64].hvalues[fi as u64]);
+}
+
+fn cmd_hdel(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 3 {
+        return err_arity(out, STR_PTR("hdel"), STR_LEN("hdel"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_HASH, now_ms);
+    if idx == -1 {
+        return resp_int(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let removed: i64 = 0;
+    let i: u64 = 2;
+    while i < len(args) {
+        let fi: i64 = hash_field_index(s, e, &args[i]);
+        if fi >= 0 {
+            let dropped_f = s.entries[e].hfields.remove(fi as u64);
+            let dropped_v = s.entries[e].hvalues.remove(fi as u64);
+            removed = removed + 1;
+        };
+        i = i + 1;
+    }
+    if len(s.entries[e].hfields) == 0 {
+        entry_tombstone(s, e);
+    };
+    return resp_int(out, removed);
+}
+
+fn cmd_hgetall(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("hgetall"), STR_LEN("hgetall"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_HASH, now_ms);
+    if idx == -1 {
+        return resp_array_header(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    out = resp_array_header(out, (len(s.entries[e].hfields) * 2) as i64);
+    let i: u64 = 0;
+    while i < len(s.entries[e].hfields) {
+        out = resp_bulk(out, &s.entries[e].hfields[i]);
+        out = resp_bulk(out, &s.entries[e].hvalues[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- list commands ----
+
+// Normalize a Redis-style [start, stop] range over length L.
+// Returns (ok, first, last) with ok=false for an empty result.
+fn range_normalize(start: i64, stop: i64, L: i64) -> (bool, i64, i64) {
+    let a: i64 = start;
+    let b: i64 = stop;
+    if a < 0 {
+        a = a + L;
+        if a < 0 {
+            a = 0;
+        };
+    };
+    if b < 0 {
+        b = b + L;
+    };
+    if b < 0 || a >= L || a > b {
+        return (false, 0, 0);
+    };
+    if b >= L {
+        b = L - 1;
+    };
+    return (true, a, b);
+}
+
+fn cmd_lpush(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 3 {
+        return err_arity(out, STR_PTR("lpush"), STR_LEN("lpush"));
+    };
+    let idx: i64 = lookup_or_create(s, &args[1], KIND_LIST, now_ms);
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let i: u64 = 2;
+    while i < len(args) {
+        // prepend: rebuild items as [arg] ++ old items (deep copies)
+        let fresh: Vec<Vec<u8>> = Vec::new();
+        fresh.push(bytes_clone(&args[i]));
+        let j: u64 = 0;
+        while j < len(s.entries[e].litems) {
+            fresh.push(bytes_clone(&s.entries[e].litems[j]));
+            j = j + 1;
+        }
+        s.entries[e].litems = fresh;
+        i = i + 1;
+    }
+    return resp_int(out, len(s.entries[e].litems) as i64);
+}
+
+fn cmd_rpush(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 3 {
+        return err_arity(out, STR_PTR("rpush"), STR_LEN("rpush"));
+    };
+    let idx: i64 = lookup_or_create(s, &args[1], KIND_LIST, now_ms);
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let i: u64 = 2;
+    while i < len(args) {
+        s.entries[e].litems.push(bytes_clone(&args[i]));
+        i = i + 1;
+    }
+    return resp_int(out, len(s.entries[e].litems) as i64);
+}
+
+// Shared LPOP/RPOP body. from_head selects the side; count < 0
+// means "no count argument given" (single-element bulk reply).
+fn pop_side(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>, from_head: bool, name: ptr, name_len: u64) -> Vec<u8> {
+    if len(args) < 2 || len(args) > 3 {
+        return err_arity(out, name, name_len);
+    };
+    let count: i64 = 0 - 1;
+    if len(args) == 3 {
+        let (ok, c) = parse_i64_full(&args[2]);
+        if ok != true {
+            return err_not_int(out);
+        };
+        if c < 0 {
+            return resp_error(out, STR_PTR("ERR value is out of range, must be positive"), STR_LEN("ERR value is out of range, must be positive"));
+        };
+        count = c;
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_LIST, now_ms);
+    if idx == -1 {
+        if count < 0 {
+            return resp_nil(out);
+        };
+        return resp_array_header(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    if count < 0 {
+        if from_head {
+            let v = s.entries[e].litems.remove(0);
+            out = resp_bulk(out, &v);
+        } else {
+            match s.entries[e].litems.pop() {
+                Some(v) => {
+                    out = resp_bulk(out, &v);
+                },
+                None => {
+                    out = resp_nil(out);
+                },
+            };
+        };
+        if len(s.entries[e].litems) == 0 {
+            entry_tombstone(s, e);
+        };
+        return out;
+    };
+    let avail: i64 = len(s.entries[e].litems) as i64;
+    let take: i64 = count;
+    if take > avail {
+        take = avail;
+    };
+    out = resp_array_header(out, take);
+    let k: i64 = 0;
+    while k < take {
+        if from_head {
+            let v2 = s.entries[e].litems.remove(0);
+            out = resp_bulk(out, &v2);
+        } else {
+            match s.entries[e].litems.pop() {
+                Some(v2) => {
+                    out = resp_bulk(out, &v2);
+                },
+                None => {
+                    out = resp_nil(out);
+                },
+            };
+        };
+        k = k + 1;
+    }
+    if len(s.entries[e].litems) == 0 {
+        entry_tombstone(s, e);
+    };
+    return out;
+}
+
+fn cmd_lpop(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    return pop_side(s, args, now_ms, out, true, STR_PTR("lpop"), STR_LEN("lpop"));
+}
+
+fn cmd_rpop(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    return pop_side(s, args, now_ms, out, false, STR_PTR("rpop"), STR_LEN("rpop"));
+}
+
+fn cmd_lrange(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 4 {
+        return err_arity(out, STR_PTR("lrange"), STR_LEN("lrange"));
+    };
+    let (ok1, start) = parse_i64_full(&args[2]);
+    if ok1 != true {
+        return err_not_int(out);
+    };
+    let (ok2, stop) = parse_i64_full(&args[3]);
+    if ok2 != true {
+        return err_not_int(out);
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_LIST, now_ms);
+    if idx == -1 {
+        return resp_array_header(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let L: i64 = len(s.entries[e].litems) as i64;
+    let (rok, a, b) = range_normalize(start, stop, L);
+    if rok != true {
+        return resp_array_header(out, 0);
+    };
+    out = resp_array_header(out, b - a + 1);
+    let i: i64 = a;
+    while i <= b {
+        out = resp_bulk(out, &s.entries[e].litems[i as u64]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cmd_llen(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("llen"), STR_LEN("llen"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_LIST, now_ms);
+    if idx == -1 {
+        return resp_int(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    return resp_int(out, len(s.entries[idx as u64].litems) as i64);
+}
+
+// ---- set commands ----
+
+fn set_member_index(s: &Store, e: u64, member: &Vec<u8>) -> i64 {
+    let i: u64 = 0;
+    while i < len(s.entries[e].smembers) {
+        if bytes_eq(&s.entries[e].smembers[i], member) {
+            return i as i64;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn cmd_sadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 3 {
+        return err_arity(out, STR_PTR("sadd"), STR_LEN("sadd"));
+    };
+    let idx: i64 = lookup_or_create(s, &args[1], KIND_SET, now_ms);
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let added: i64 = 0;
+    let i: u64 = 2;
+    while i < len(args) {
+        if set_member_index(s, e, &args[i]) < 0 {
+            s.entries[e].smembers.push(bytes_clone(&args[i]));
+            added = added + 1;
+        };
+        i = i + 1;
+    }
+    return resp_int(out, added);
+}
+
+fn cmd_srem(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 3 {
+        return err_arity(out, STR_PTR("srem"), STR_LEN("srem"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_SET, now_ms);
+    if idx == -1 {
+        return resp_int(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let removed: i64 = 0;
+    let i: u64 = 2;
+    while i < len(args) {
+        let mi: i64 = set_member_index(s, e, &args[i]);
+        if mi >= 0 {
+            let dropped = s.entries[e].smembers.remove(mi as u64);
+            removed = removed + 1;
+        };
+        i = i + 1;
+    }
+    if len(s.entries[e].smembers) == 0 {
+        entry_tombstone(s, e);
+    };
+    return resp_int(out, removed);
+}
+
+fn cmd_smembers(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 2 {
+        return err_arity(out, STR_PTR("smembers"), STR_LEN("smembers"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_SET, now_ms);
+    if idx == -1 {
+        return resp_array_header(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    out = resp_array_header(out, len(s.entries[e].smembers) as i64);
+    let i: u64 = 0;
+    while i < len(s.entries[e].smembers) {
+        out = resp_bulk(out, &s.entries[e].smembers[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn cmd_sismember(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 3 {
+        return err_arity(out, STR_PTR("sismember"), STR_LEN("sismember"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_SET, now_ms);
+    if idx == -1 {
+        return resp_int(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    if set_member_index(s, idx as u64, &args[2]) >= 0 {
+        return resp_int(out, 1);
+    };
+    return resp_int(out, 0);
+}
+
+// ---- zset commands ----
+// Storage is insertion-ordered (member, score) pairs; ZRANGE sorts
+// a scratch index by (score, member) per call -- the M0 standard
+// representation, recorded in docs/M0_DELIVERY.md.
+
+fn zset_member_index(s: &Store, e: u64, member: &Vec<u8>) -> i64 {
+    let i: u64 = 0;
+    while i < len(s.entries[e].zrows) {
+        if bytes_eq(&s.entries[e].zrows[i].member, member) {
+            return i as i64;
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn bytes_lt(a: &Vec<u8>, b: &Vec<u8>) -> bool {
+    let n: u64 = len(a);
+    if len(b) < n {
+        n = len(b);
+    };
+    let i: u64 = 0;
+    while i < n {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        };
+        i = i + 1;
+    }
+    return len(a) < len(b);
+}
+
+// true when zset row x must sort before row y: score asc, then
+// member bytes asc (Redis's lexicographic tie-break).
+fn zset_row_before(s: &Store, e: u64, x: u64, y: u64) -> bool {
+    let sx: f64 = s.entries[e].zrows[x].score;
+    let sy: f64 = s.entries[e].zrows[y].score;
+    if sx != sy {
+        return sx < sy;
+    };
+    return bytes_lt(&s.entries[e].zrows[x].member, &s.entries[e].zrows[y].member);
+}
+
+fn cmd_zadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 4 {
+        return err_arity(out, STR_PTR("zadd"), STR_LEN("zadd"));
+    };
+    if len(args) % 2 != 0 {
+        return err_syntax(out);
+    };
+    // Pass 1 validates every score: a bad score aborts the whole
+    // command before anything is applied. Pass 2 re-parses while
+    // applying (the parser is pure, so the values are identical).
+    // No staging Vec<f64>: bare Vec<f64> element reads are broken
+    // in the current toolchain (see docs/M0_DELIVERY.md).
+    let i: u64 = 2;
+    while i < len(args) {
+        let (ok, sc) = parse_f64_full(&args[i]);
+        if ok != true {
+            return err_float(out);
+        };
+        i = i + 2;
+    }
+    let idx: i64 = lookup_or_create(s, &args[1], KIND_ZSET, now_ms);
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let added: i64 = 0;
+    let p: u64 = 2;
+    while p < len(args) {
+        let (ok2, sc2) = parse_f64_full(&args[p]);
+        let mi: i64 = zset_member_index(s, e, &args[p + 1]);
+        if mi >= 0 {
+            s.entries[e].zrows[mi as u64].score = sc2;
+        } else {
+            s.entries[e].zrows.push(ZRow { member: bytes_clone(&args[p + 1]), score: sc2 });
+            added = added + 1;
+        };
+        p = p + 2;
+    }
+    return resp_int(out, added);
+}
+
+fn cmd_zscore(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 3 {
+        return err_arity(out, STR_PTR("zscore"), STR_LEN("zscore"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_ZSET, now_ms);
+    if idx == -1 {
+        return resp_nil(out);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let mi: i64 = zset_member_index(s, e, &args[2]);
+    if mi < 0 {
+        return resp_nil(out);
+    };
+    let text: Vec<u8> = fmt_f64(s.entries[e].zrows[mi as u64].score);
+    return resp_bulk(out, &text);
+}
+
+fn cmd_zrange(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 4 || len(args) > 5 {
+        return err_arity(out, STR_PTR("zrange"), STR_LEN("zrange"));
+    };
+    let withscores: bool = false;
+    if len(args) == 5 {
+        if bytes_eq_lit_ci(&args[4], STR_PTR("WITHSCORES"), STR_LEN("WITHSCORES")) {
+            withscores = true;
+        } else {
+            return err_syntax(out);
+        };
+    };
+    let (ok1, start) = parse_i64_full(&args[2]);
+    if ok1 != true {
+        return err_not_int(out);
+    };
+    let (ok2, stop) = parse_i64_full(&args[3]);
+    if ok2 != true {
+        return err_not_int(out);
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_ZSET, now_ms);
+    if idx == -1 {
+        return resp_array_header(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let n: u64 = len(s.entries[e].zrows);
+    // insertion-sort a scratch index into (score, member) order
+    let order: Vec<u64> = Vec::new();
+    let i0: u64 = 0;
+    while i0 < n {
+        order.push(i0);
+        i0 = i0 + 1;
+    }
+    let i: u64 = 1;
+    while i < n {
+        let key_row: u64 = order[i];
+        let j: u64 = i;
+        while j > 0 {
+            if zset_row_before(s, e, key_row, order[j - 1]) != true {
+                break;
+            };
+            order[j] = order[j - 1];
+            j = j - 1;
+        }
+        order[j] = key_row;
+        i = i + 1;
+    }
+    let (rok, a, b) = range_normalize(start, stop, n as i64);
+    if rok != true {
+        return resp_array_header(out, 0);
+    };
+    let total: i64 = b - a + 1;
+    if withscores {
+        out = resp_array_header(out, total * 2);
+    } else {
+        out = resp_array_header(out, total);
+    };
+    let k: i64 = a;
+    while k <= b {
+        let row: u64 = order[k as u64];
+        out = resp_bulk(out, &s.entries[e].zrows[row].member);
+        if withscores {
+            let text: Vec<u8> = fmt_f64(s.entries[e].zrows[row].score);
+            out = resp_bulk(out, &text);
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+fn cmd_zrem(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 3 {
+        return err_arity(out, STR_PTR("zrem"), STR_LEN("zrem"));
+    };
+    let idx: i64 = lookup_typed(s, &args[1], KIND_ZSET, now_ms);
+    if idx == -1 {
+        return resp_int(out, 0);
+    };
+    if idx == -2 {
+        return err_wrongtype(out);
+    };
+    let e: u64 = idx as u64;
+    let removed: i64 = 0;
+    let i: u64 = 2;
+    while i < len(args) {
+        let mi: i64 = zset_member_index(s, e, &args[i]);
+        if mi >= 0 {
+            let dropped_m = s.entries[e].zrows.remove(mi as u64);
+            removed = removed + 1;
+        };
+        i = i + 1;
+    }
+    if len(s.entries[e].zrows) == 0 {
+        entry_tombstone(s, e);
+    };
+    return resp_int(out, removed);
+}
+
+// ---- dispatch ----
+
+fn exec_command(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) == 0 {
+        return out;
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("PING"), STR_LEN("PING")) {
+        return cmd_ping(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("ECHO"), STR_LEN("ECHO")) {
+        return cmd_echo(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("SET"), STR_LEN("SET")) {
+        return cmd_set(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("GET"), STR_LEN("GET")) {
+        return cmd_get(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("DEL"), STR_LEN("DEL")) {
+        return cmd_del(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("EXISTS"), STR_LEN("EXISTS")) {
+        return cmd_exists(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("TYPE"), STR_LEN("TYPE")) {
+        return cmd_type(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("INCR"), STR_LEN("INCR")) {
+        return cmd_incr(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("DECR"), STR_LEN("DECR")) {
+        return cmd_decr(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("EXPIRE"), STR_LEN("EXPIRE")) {
+        return cmd_expire(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("TTL"), STR_LEN("TTL")) {
+        return cmd_ttl(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("PTTL"), STR_LEN("PTTL")) {
+        return cmd_pttl(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("PERSIST"), STR_LEN("PERSIST")) {
+        return cmd_persist(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("HSET"), STR_LEN("HSET")) {
+        return cmd_hset(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("HGET"), STR_LEN("HGET")) {
+        return cmd_hget(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("HDEL"), STR_LEN("HDEL")) {
+        return cmd_hdel(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("HGETALL"), STR_LEN("HGETALL")) {
+        return cmd_hgetall(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("LPUSH"), STR_LEN("LPUSH")) {
+        return cmd_lpush(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("RPUSH"), STR_LEN("RPUSH")) {
+        return cmd_rpush(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("LPOP"), STR_LEN("LPOP")) {
+        return cmd_lpop(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("RPOP"), STR_LEN("RPOP")) {
+        return cmd_rpop(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("LRANGE"), STR_LEN("LRANGE")) {
+        return cmd_lrange(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("LLEN"), STR_LEN("LLEN")) {
+        return cmd_llen(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("SADD"), STR_LEN("SADD")) {
+        return cmd_sadd(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("SREM"), STR_LEN("SREM")) {
+        return cmd_srem(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("SMEMBERS"), STR_LEN("SMEMBERS")) {
+        return cmd_smembers(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("SISMEMBER"), STR_LEN("SISMEMBER")) {
+        return cmd_sismember(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("ZADD"), STR_LEN("ZADD")) {
+        return cmd_zadd(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("ZSCORE"), STR_LEN("ZSCORE")) {
+        return cmd_zscore(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("ZRANGE"), STR_LEN("ZRANGE")) {
+        return cmd_zrange(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("ZREM"), STR_LEN("ZREM")) {
+        return cmd_zrem(s, args, now_ms, out);
+    };
+    return err_unknown(out, &args[0]);
+}

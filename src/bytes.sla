@@ -1,0 +1,424 @@
+// bytes.sla -- byte-string and number utilities for slaredis.
+//
+// Everything in slaredis is a byte string (Vec<u8>), never a String:
+// RESP is a binary protocol, keys/values are arbitrary octets, and
+// the SLA String-in-struct shape is a known mislower risk on the
+// SAB/flatten path (sa_std/http_proxy.sla records the same rule).
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/fmt.sai"
+@import "sa_std/core/slice.sa"
+
+fn bytes_clone(a: &Vec<u8>) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    let i: u64 = 0;
+    while i < len(a) {
+        out.push(a[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn bytes_eq(a: &Vec<u8>, b: &Vec<u8>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Case-insensitive (ASCII) compare of a byte string against a string
+// literal given as (ptr, len) from STR_PTR / STR_LEN. Used for
+// command-name matching: RESP command names are case-insensitive.
+fn bytes_eq_lit_ci(a: &Vec<u8>, lit: ptr, lit_len: u64) -> bool {
+    if len(a) != lit_len {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < lit_len {
+        let x: u8 = a[i];
+        let y: u8 = PTR_BYTE_AT(lit, i);
+        if x >= 97 && x <= 122 {
+            x = x - 32;
+        };
+        if y >= 97 && y <= 122 {
+            y = y - 32;
+        };
+        if x != y {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Append a literal's bytes to out. Value-threaded (out by move,
+// returned) like every loop-pushing writer in this codebase:
+// pushing into a borrowed &Vec<u8> parameter inside a loop traps
+// the SAB/SA referee with PhiStateConflict (probe_shapes S1,
+// 2026-10-28); the by-value form is the proven shape (S4).
+fn bytes_push_lit(out: Vec<u8>, lit: ptr, lit_len: u64) -> Vec<u8> {
+    let i: u64 = 0;
+    while i < lit_len {
+        out.push(PTR_BYTE_AT(lit, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// Append src[from..to] to out. Value-threaded, see bytes_push_lit.
+fn bytes_push_range(out: Vec<u8>, src: &Vec<u8>, from: u64, to: u64) -> Vec<u8> {
+    let i: u64 = from;
+    while i < to {
+        out.push(src[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// FNV-1a 64-bit. Used only as a pre-filter for key equality (the
+// full byte compare always decides), so hash quality is a
+// performance property, never a correctness one.
+fn bytes_hash(a: &Vec<u8>) -> u64 {
+    let h: u64 = 14695981039346656037u64;
+    let i: u64 = 0;
+    while i < len(a) {
+        h = (h ^ (a[i] as u64)) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+// ---- integers ----
+
+// Parse buf[lo..hi] as a strict Redis-style i64 ("string2l" rules):
+// optional '-', digits only, no leading zeros unless the value is
+// exactly "0", "-0" rejected, range checked. Returns (ok, value).
+fn parse_i64_range(buf: &Vec<u8>, lo: u64, hi: u64) -> (bool, i64) {
+    if hi <= lo {
+        return (false, 0);
+    };
+    let p: u64 = lo;
+    let neg: bool = false;
+    if buf[p] == 45 {
+        neg = true;
+        p = p + 1;
+        if p >= hi {
+            return (false, 0);
+        };
+    };
+    // leading zero rule: "0" alone is fine, "0x"/"-0" are not
+    if buf[p] == 48 {
+        if hi - p != 1 {
+            return (false, 0);
+        };
+        if neg {
+            return (false, 0);
+        };
+        return (true, 0);
+    };
+    let acc: u64 = 0;
+    let limit: u64 = 9223372036854775807;
+    if neg {
+        limit = 9223372036854775808u64;
+    };
+    while p < hi {
+        let b: u8 = buf[p];
+        if b < 48 || b > 57 {
+            return (false, 0);
+        };
+        let d: u64 = (b - 48) as u64;
+        if acc > (limit - d) / 10 {
+            return (false, 0);
+        };
+        acc = acc * 10 + d;
+        p = p + 1;
+    }
+    if neg {
+        if acc == 9223372036854775808u64 {
+            return (true, 0 - 9223372036854775807 - 1);
+        };
+        return (true, 0 - (acc as i64));
+    };
+    return (true, acc as i64);
+}
+
+fn parse_i64_full(a: &Vec<u8>) -> (bool, i64) {
+    return parse_i64_range(a, 0, len(a));
+}
+
+// Append the decimal form of v to out. Value-threaded, see
+// bytes_push_lit.
+fn append_i64(out: Vec<u8>, v: i64) -> Vec<u8> {
+    let x: i64 = v;
+    if x < 0 {
+        out.push(45);
+        x = 0 - x;
+    };
+    let digs: [u8; 20] = [0u8; 20];
+    let nd: u64 = 0;
+    if x == 0 {
+        out.push(48);
+        return out;
+    };
+    while x > 0 {
+        digs[nd] = (48 + (x % 10)) as u8;
+        nd = nd + 1;
+        x = x / 10;
+    }
+    let i: u64 = 0;
+    while i < nd {
+        out.push(digs[nd - 1 - i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- floating point (scores) ----
+
+fn f64_abs(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v;
+    };
+    return v;
+}
+
+// Parse a score: [+-] digits [. digits] [(e|E) [+-] digits], plus
+// inf / +inf / -inf. NaN is rejected (as in Redis's ZADD path).
+// Decimal parser: exact for typical scores; the last ulp can differ
+// from a correctly-rounded strtod for adversarial inputs (recorded
+// in docs/M0_DELIVERY.md). Returns (ok, value).
+fn parse_f64_full(a: &Vec<u8>) -> (bool, f64) {
+    let n: u64 = len(a);
+    if n == 0 {
+        return (false, 0.0);
+    };
+    // inf spellings (case-insensitive)
+    if n == 3 || n == 4 {
+        let t: Vec<u8> = Vec::new();
+        let i: u64 = 0;
+        while i < n {
+            let b: u8 = a[i];
+            if b >= 65 && b <= 90 {
+                b = b + 32;
+            };
+            t.push(b);
+            i = i + 1;
+        }
+        if bytes_eq_lit_ci(&t, STR_PTR("inf"), STR_LEN("inf")) {
+            return (true, 1.0 / 0.0);
+        };
+        if bytes_eq_lit_ci(&t, STR_PTR("+inf"), STR_LEN("+inf")) {
+            return (true, 1.0 / 0.0);
+        };
+        if bytes_eq_lit_ci(&t, STR_PTR("-inf"), STR_LEN("-inf")) {
+            return (true, 0.0 - (1.0 / 0.0));
+        };
+        if bytes_eq_lit_ci(&t, STR_PTR("nan"), STR_LEN("nan")) {
+            return (false, 0.0);
+        };
+    };
+    let p: u64 = 0;
+    let neg: bool = false;
+    if a[p] == 45 || a[p] == 43 {
+        neg = a[p] == 45;
+        p = p + 1;
+        if p >= n {
+            return (false, 0.0);
+        };
+    };
+    let value: f64 = 0.0;
+    let any_digits: bool = false;
+    while p < n {
+        let b: u8 = a[p];
+        if b < 48 || b > 57 {
+            break;
+        };
+        value = value * 10.0 + ((b - 48) as f64);
+        any_digits = true;
+        p = p + 1;
+    }
+    // NOTE: && does not short-circuit in SLA, so a bounds check may
+    // never guard an index on its right-hand side -- a[p] with
+    // p == n traps. All such sites use nested ifs.
+    let has_frac: bool = false;
+    if p < n {
+        if a[p] == 46 {
+            has_frac = true;
+        };
+    };
+    if has_frac {
+        p = p + 1;
+        let scale: f64 = 0.1;
+        while p < n {
+            let b2: u8 = a[p];
+            if b2 < 48 || b2 > 57 {
+                break;
+            };
+            value = value + ((b2 - 48) as f64) * scale;
+            scale = scale * 0.1;
+            any_digits = true;
+            p = p + 1;
+        }
+    };
+    if any_digits != true {
+        return (false, 0.0);
+    };
+    let has_exp: bool = false;
+    if p < n {
+        if a[p] == 101 || a[p] == 69 {
+            has_exp = true;
+        };
+    };
+    if has_exp {
+        p = p + 1;
+        let eneg: bool = false;
+        if p < n {
+            if a[p] == 45 || a[p] == 43 {
+                eneg = a[p] == 45;
+                p = p + 1;
+            };
+        };
+        let e: i64 = 0;
+        let e_digits: bool = false;
+        while p < n {
+            let b3: u8 = a[p];
+            if b3 < 48 || b3 > 57 {
+                break;
+            };
+            if e < 100000 {
+                e = e * 10 + ((b3 - 48) as i64);
+            };
+            e_digits = true;
+            p = p + 1;
+        }
+        if e_digits != true {
+            return (false, 0.0);
+        };
+        if e > 323 {
+            if eneg {
+                value = 0.0;
+            } else {
+                value = 1.0 / 0.0;
+            };
+            p = n;
+        } else {
+            let k: i64 = 0;
+            if eneg {
+                while k < e {
+                    value = value / 10.0;
+                    k = k + 1;
+                }
+            } else {
+                while k < e {
+                    value = value * 10.0;
+                    k = k + 1;
+                }
+            };
+        };
+    };
+    if p != n {
+        return (false, 0.0);
+    };
+    if neg {
+        value = 0.0 - value;
+    };
+    return (true, value);
+}
+
+// Extreme-magnitude score formatting via the std formatter
+// (precision 17), isolated from fmt_f64 for the reason noted there.
+fn fmt_f64_extreme(v: f64) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    let arr: [u8; 64] = [0u8; 64];
+    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    let olen: u64 = 0;
+    let st: i32 = sa_fmt_f64_into(v, 17, ap, 64, &olen);
+    if st == 0 && olen > 0 {
+        let i: u64 = 0;
+        while i < olen {
+            out.push(arr[i]);
+            i = i + 1;
+        }
+        return out;
+    };
+    return bytes_push_lit(out, STR_PTR("0"), STR_LEN("0"));
+}
+
+// Format a score the way a client expects to read it back: integral
+// values print without a fraction ("2"), others print as a decimal
+// with up to 17 fraction digits, trailing zeros trimmed ("1.5").
+// Extreme magnitudes go through sa_fmt_f64_into. This is a close
+// approximation of Redis's %.17g form, not a bit-exact replica
+// (recorded in docs/M0_DELIVERY.md).
+fn fmt_f64(v: f64) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    if v != v {
+        return bytes_push_lit(out, STR_PTR("nan"), STR_LEN("nan"));
+    };
+    if v == (1.0 / 0.0) {
+        return bytes_push_lit(out, STR_PTR("inf"), STR_LEN("inf"));
+    };
+    if v == (0.0 - (1.0 / 0.0)) {
+        return bytes_push_lit(out, STR_PTR("-inf"), STR_LEN("-inf"));
+    };
+    let av: f64 = f64_abs(v);
+    if av >= 100000000000000000.0 {
+        // extreme magnitude lives in its own function: a branch
+        // holding a stack array + extern call corrupts value-
+        // threaded Vec state on the fall-through path in the
+        // current toolchain (minimal repro in docs/M0_DELIVERY.md)
+        return fmt_f64_extreme(v);
+    };
+    let ip: u64 = av as u64;
+    let frac: f64 = av - (ip as f64);
+    if v < 0.0 {
+        out.push(45);
+    };
+    // integer part appended straight onto out: staging it in a
+    // scratch Vec via tmp = append_i64(tmp, ...) and then copying
+    // it by (&tmp, len(tmp)) into another call loses the bytes --
+    // a Vec reassigned from a value-threaded call misbehaves as a
+    // by-reference copy source (toolchain defect, minimal repro
+    // in docs/repros/repro_staging_copy.sla)
+    out = append_i64(out, ip as i64);
+    if frac > 0.0 {
+        out.push(46);
+        let f: f64 = frac;
+        let digits: Vec<u8> = Vec::new();
+        let k: u64 = 0;
+        while k < 17 {
+            f = f * 10.0;
+            let d: u64 = f as u64;
+            digits.push((48 + d) as u8);
+            f = f - (d as f64);
+            if f < 0.00000000000000005 {
+                k = 17;
+            } else {
+                k = k + 1;
+            };
+        }
+        // trim trailing zeros (nested ifs: && does not short-circuit)
+        let dn: u64 = len(digits);
+        while dn > 0 {
+            if digits[dn - 1] != 48 {
+                break;
+            };
+            dn = dn - 1;
+        }
+        if dn == 0 {
+            // fraction rounded away entirely; drop the '.'
+            let popped = out.pop();
+            return out;
+        };
+        out = bytes_push_range(out, &digits, 0, dn);
+    };
+    return out;
+}

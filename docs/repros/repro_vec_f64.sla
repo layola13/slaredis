@@ -1,0 +1,8 @@
+// REPRO: bare Vec<f64> element reads return 0.0.
+// Expected: main returns 2 (truncation of 2.5).
+// Actual (sa 0.1.8, sa_plugin_sla 59cbcfa8): returns 0.
+// Vec<i64> with the same shape returns the stored value, and an
+// f64 field inside a struct element of a Vec reads back correctly
+// (slaredis stores zset scores in a ZRow struct for this reason).
+@import "sa_std/vec.sa"
+fn main() -> i32 { let s: Vec<f64> = Vec::new(); s.push(2.5); return (s[0]) as i32; }

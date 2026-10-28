@@ -1,0 +1,359 @@
+// probe_loop.sla — BN line risk probe #2 (not part of the product).
+// Model under test: single-threaded round-robin event loop over
+// nonblocking sockets (Redis's own shape; chosen because SLA's
+// Mutex<T> constructor type-checks only for scalar T — Mutex<Store>
+// failed with error.TypeMismatch — and sa_std has no poll/epoll
+// surface over TCP streams).
+// Stages:
+//   A. &Store mutation shapes (scalar assign / Vec push / index-path
+//      nested scalar assign / index-path nested Vec push /
+//      whole-element replace), single-threaded owner.
+//   C. sa_time_unix_ms sanity.
+//   N. Nonblocking net semantics, driven by probe2_client.py:
+//      empty-accept status, empty-read status, interleaved fragment
+//      reads on two connections, per-line reply, EOF observation,
+//      sa_std_close effect.
+// Results are reported as one text line over a second listener
+// (port 7798): sa_print_bytes traps CapabilityMismatch against the
+// stack-array pointer shape, so this probe does not print; the net
+// write path (same staging shape as sa_std/dns.sla) carries the
+// report instead. Exit code 0 = all pass; 100 + stage = failure.
+@import "sa_std/net.sai"
+@import "sa_std/time.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/status.sla"
+@import "sa_std/thread.sa"
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/core/slice.sa"
+
+struct HashVal { fields: Vec<Vec<u8>>, values: Vec<Vec<u8>> }
+struct Entry { key: Vec<u8>, kind: u8, expire_ms: i64, payload: i64 }
+struct Store { entries: Vec<Entry>, strings: Vec<Vec<u8>>, hashes: Vec<HashVal>, counter: i64 }
+struct Conn { stream: u64, buf: Vec<u8>, open: bool, replied: bool }
+
+fn mkbytes4(a: u8, b: u8, c: u8, d: u8) -> Vec<u8> {
+    let v: Vec<u8> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v.push(d);
+    return v;
+}
+
+// Append "<t1><t2>=<v> " to the report Vec (decimal, signed).
+fn rep_status(r: &Vec<u8>, t1: u8, t2: u8, v: i64) {
+    r.push(t1);
+    r.push(t2);
+    r.push(61);
+    let x: i64 = v;
+    if x < 0 {
+        r.push(45);
+        x = 0 - x;
+    };
+    let digs: [u8; 20] = [0u8; 20];
+    let nd: u64 = 0;
+    if x == 0 {
+        digs[0] = 48;
+        nd = 1;
+    } else {
+        while x > 0 {
+            digs[nd] = (48 + (x % 10)) as u8;
+            nd = nd + 1;
+            x = x / 10;
+        }
+    };
+    let i: u64 = 0;
+    while i < nd {
+        r.push(digs[nd - 1 - i]);
+        i = i + 1;
+    }
+    r.push(32);
+}
+
+fn store_new() -> Store {
+    return Store { entries: Vec::new(), strings: Vec::new(), hashes: Vec::new(), counter: 0 };
+}
+
+fn a1_scalar(s: &Store) {
+    s.counter = 41;
+}
+
+fn a2_push(s: &Store) {
+    s.entries.push(Entry { key: mkbytes4(107, 101, 121, 49), kind: 1, expire_ms: 0, payload: 0 });
+    s.strings.push(mkbytes4(118, 97, 108, 49));
+    s.hashes.push(HashVal { fields: Vec::new(), values: Vec::new() });
+}
+
+fn a3_nested_scalar(s: &Store) {
+    s.entries[0].expire_ms = 99000;
+}
+
+fn a4_nested_push(s: &Store) {
+    s.hashes[0].fields.push(mkbytes4(102, 105, 101, 108));
+    s.hashes[0].values.push(mkbytes4(118, 97, 108, 120));
+}
+
+fn a5_replace(s: &Store) {
+    let nk: Vec<u8> = Vec::new();
+    let i: u64 = 0;
+    while i < len(s.entries[0].key) {
+        nk.push(s.entries[0].key[i]);
+        i = i + 1;
+    }
+    s.entries[0] = Entry { key: nk, kind: 2, expire_ms: 5, payload: 7 };
+}
+
+fn bytes_eq(a: &Vec<u8>, b: &Vec<u8>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// One nonblocking read on conns[i]; appends bytes. Returns:
+//   0 = no data right now, 1 = got bytes, 2 = EOF (peer closed)
+fn conn_pump(conns: &Vec<Conn>, i: u64) -> i32 {
+    let buf: [u8; 4096] = [0u8; 4096];
+    let bp: ptr = PTR_BYTE_ADD(&buf, 0);
+    let nread: u64 = 0;
+    let st: i32 = sa_std_net_tcp_stream_read(conns[i].stream, bp, 4096, &nread);
+    if st != SA_STD_OK {
+        return 0;
+    };
+    if nread == 0 {
+        return 2;
+    };
+    let j: u64 = 0;
+    while j < nread {
+        conns[i].buf.push(buf[j]);
+        j = j + 1;
+    }
+    return 1;
+}
+
+fn conn_has_ping(c: &Conn) -> bool {
+    if len(c.buf) < 6 {
+        return false;
+    };
+    if c.buf[0] != 80 {
+        return false;
+    };
+    if c.buf[1] != 73 {
+        return false;
+    };
+    if c.buf[2] != 78 {
+        return false;
+    };
+    if c.buf[3] != 71 {
+        return false;
+    };
+    if c.buf[4] != 13 {
+        return false;
+    };
+    if c.buf[5] != 10 {
+        return false;
+    };
+    return true;
+}
+
+fn conn_reply_pong(conns: &Vec<Conn>, i: u64) -> i32 {
+    let out: [u8; 8] = [0u8; 8];
+    out[0] = 43;
+    out[1] = 80;
+    out[2] = 79;
+    out[3] = 78;
+    out[4] = 71;
+    out[5] = 13;
+    out[6] = 10;
+    let op: ptr = PTR_BYTE_ADD(&out, 0);
+    let written: u64 = 0;
+    let st: i32 = sa_std_net_tcp_stream_write(conns[i].stream, op, 7, &written);
+    if st != SA_STD_OK {
+        return 1;
+    };
+    if written != 7 {
+        return 2;
+    };
+    conns[i].buf = Vec::new();
+    conns[i].replied = true;
+    return 0;
+}
+
+// Write the whole report Vec to a stream (staged via stack array).
+fn send_report(stream: u64, r: &Vec<u8>) -> i32 {
+    let arr: [u8; 256] = [0u8; 256];
+    let n: u64 = len(r);
+    let i: u64 = 0;
+    while i < n {
+        arr[i] = r[i];
+        i = i + 1;
+    }
+    let p: ptr = PTR_BYTE_ADD(&arr, 0);
+    let written: u64 = 0;
+    let st: i32 = sa_std_net_tcp_stream_write(stream, p, n, &written);
+    if st != SA_STD_OK {
+        return 1;
+    };
+    if written != n {
+        return 2;
+    };
+    return 0;
+}
+
+fn main() -> i32 {
+    let rep: Vec<u8> = Vec::new();
+    // report listener first, so the driver can always collect results
+    let rlistener: u64 = 0;
+    let rbound: u32 = 0;
+    let rlst: i32 = sa_std_net_tcp_listen(STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), 7798, &rlistener, &rbound);
+    if rlst != SA_STD_OK {
+        return 150;
+    };
+    // ---- Stage A ----
+    let st = store_new();
+    a1_scalar(&st);
+    if st.counter != 41 {
+        return 101;
+    };
+    a2_push(&st);
+    if len(st.entries) != 1 {
+        return 102;
+    };
+    a3_nested_scalar(&st);
+    if st.entries[0].expire_ms != 99000 {
+        return 103;
+    };
+    a4_nested_push(&st);
+    if len(st.hashes[0].fields) != 1 {
+        return 104;
+    };
+    if bytes_eq(&st.hashes[0].values[0], &mkbytes4(118, 97, 108, 120)) != true {
+        return 105;
+    };
+    a5_replace(&st);
+    if st.entries[0].kind != 2 {
+        return 106;
+    };
+    if st.entries[0].payload != 7 {
+        return 107;
+    };
+    rep.push(65);
+    rep.push(32);
+
+    // ---- Stage C ----
+    let now_ms: i64 = sa_time_unix_ms();
+    if now_ms < 1700000000000 {
+        return 108;
+    };
+    rep.push(67);
+    rep.push(32);
+
+    // ---- Stage N: nonblocking loop ----
+    let listener: u64 = 0;
+    let bound: u32 = 0;
+    let lst: i32 = sa_std_net_tcp_listen(STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), 7799, &listener, &bound);
+    if lst != SA_STD_OK {
+        return 112;
+    };
+    let nbl: i32 = sa_std_net_tcp_listener_set_nonblocking(listener, 1);
+    if nbl != SA_STD_OK {
+        return 113;
+    };
+    // empty accept: nobody connected yet
+    let s0: u64 = 0;
+    let ast0: i32 = sa_std_net_tcp_accept(listener, &s0);
+    rep_status(&rep, 78, 49, ast0 as i64);
+    rep_status(&rep, 72, 48, s0 as i64);
+    // poll-accept connection A
+    let conns: Vec<Conn> = Vec::new();
+    let guard: i64 = 0;
+    while len(conns) < 1 && guard < 100000 {
+        let s: u64 = 0;
+        let ast: i32 = sa_std_net_tcp_accept(listener, &s);
+        if ast == SA_STD_OK {
+            if s != 0 {
+                let nb: i32 = sa_std_net_tcp_stream_set_nonblocking(s, 1);
+                conns.push(Conn { stream: s, buf: Vec::new(), open: true, replied: false });
+            };
+        };
+        THREAD_SLEEP_MS(1);
+        guard = guard + 1;
+    }
+    if len(conns) != 1 {
+        return 114;
+    };
+    // empty read on A: client connected but sent nothing yet
+    let eb: [u8; 64] = [0u8; 64];
+    let ebp: ptr = PTR_BYTE_ADD(&eb, 0);
+    let en: u64 = 0;
+    let erst: i32 = sa_std_net_tcp_stream_read(conns[0].stream, ebp, 64, &en);
+    rep_status(&rep, 82, 48, erst as i64);
+    rep_status(&rep, 78, 48, en as i64);
+    // main loop: accept B, pump both, reply per complete PING line,
+    // finish when both replied and both EOF-closed.
+    let rounds: i64 = 0;
+    let closed_count: i64 = 0;
+    while rounds < 200000 {
+        if len(conns) < 2 {
+            let s: u64 = 0;
+            let ast: i32 = sa_std_net_tcp_accept(listener, &s);
+            if ast == SA_STD_OK {
+                if s != 0 {
+                    let nb2: i32 = sa_std_net_tcp_stream_set_nonblocking(s, 1);
+                    conns.push(Conn { stream: s, buf: Vec::new(), open: true, replied: false });
+                };
+            };
+        };
+        let ci: u64 = 0;
+        while ci < len(conns) {
+            if conns[ci].open {
+                let pr: i32 = conn_pump(&conns, ci);
+                if pr == 2 {
+                    conns[ci].open = false;
+                    let cc: i32 = sa_std_close(conns[ci].stream);
+                    closed_count = closed_count + 1;
+                } else {
+                    if conn_has_ping(&conns[ci]) {
+                        if conns[ci].replied != true {
+                            let rr: i32 = conn_reply_pong(&conns, ci);
+                            if rr != 0 {
+                                return 130 + rr;
+                            };
+                        };
+                    };
+                };
+            };
+            ci = ci + 1;
+        }
+        if len(conns) == 2 {
+            if conns[0].replied && conns[1].replied && closed_count == 2 {
+                rep.push(84);
+                rep.push(32);
+                let cl: i32 = sa_std_close(listener);
+                rep.push(68);
+                rep.push(10);
+                // deliver the report on the report listener
+                let rs: u64 = 0;
+                let rast: i32 = sa_std_net_tcp_accept(rlistener, &rs);
+                if rast == SA_STD_OK {
+                    let sr: i32 = send_report(rs, &rep);
+                    let rc2: i32 = sa_std_close(rs);
+                };
+                let rcl: i32 = sa_std_close(rlistener);
+                return 0;
+            };
+        };
+        THREAD_SLEEP_MS(1);
+        rounds = rounds + 1;
+    }
+    return 140;
+}

@@ -1,0 +1,10 @@
+// REPRO: the `mut` keyword in a let binding is rejected by the
+// parser: "Syntax Error: error.UnexpectedToken" pointing at `mut`.
+// SLA variables are mutable by default (sa_std code reassigns
+// plain lets throughout), so `let mut` appears to be unsupported
+// surface in this build (sa 0.1.8, sa_plugin_sla 59cbcfa8) even
+// though sa_std/async.sla contains one `let mut` occurrence.
+// Workaround used by slaredis: plain `let` everywhere.
+@import "sa_std/vec.sa"
+fn f(a: &Vec<u8>) -> bool { let mut x: u8 = a[0]; if x >= 97 { x = x - 32; }; return x == 65; }
+fn main() -> i32 { let v: Vec<u8> = Vec::new(); v.push(97); if f(&v) { return 1; }; return 0; }

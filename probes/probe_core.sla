@@ -1,0 +1,250 @@
+// probe_core.sla — BN line risk probe #1 (not part of the product).
+// Shapes under test:
+//   A. field/Vec mutation through a &Store parameter (scalar assign,
+//      Vec push, index-path nested scalar assign, index-path nested
+//      Vec push, whole-element replace).
+//   B. Arc<Mutex<Store>> cloned into thread::spawn(^|| f(clone)),
+//      two workers x 5000 locked increments, joined, total checked.
+//   C. sa_time_unix_ms sanity.
+//   D. TCP listen/accept/read/write on loopback driven by a Python
+//      client: reads "PING\r\n", replies "+PONG\r\n", then expects
+//      EOF (out_read == 0) after the client half-closes, then closes
+//      the stream with sa_std_close and the client must see EOF.
+// Prints one letter per passed stage; exit code 0 = all pass,
+// otherwise 100 + stage number of the first failed stage.
+@import "sa_std/net.sai"
+@import "sa_std/time.sai"
+@import "sa_std/io.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/status.sla"
+@import "sa_std/sync/mutex.sa"
+@import "sa_std/core/arc.sa"
+@import "sa_std/thread.sa"
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/core/slice.sa"
+
+struct HashVal { fields: Vec<Vec<u8>>, values: Vec<Vec<u8>> }
+struct Entry { key: Vec<u8>, kind: u8, expire_ms: i64, payload: i64 }
+struct Store { entries: Vec<Entry>, strings: Vec<Vec<u8>>, hashes: Vec<HashVal>, counter: i64 }
+
+fn mkbytes4(a: u8, b: u8, c: u8, d: u8) -> Vec<u8> {
+    let v: Vec<u8> = Vec::new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v.push(d);
+    return v;
+}
+
+fn say(b: u8) {
+    let arr: [u8; 2] = [0u8; 2];
+    arr[0] = b;
+    arr[1] = 10;
+    let p: ptr = PTR_BYTE_ADD(&arr, 0);
+    sa_print_bytes(p, 2);
+}
+
+fn store_new() -> Store {
+    return Store { entries: Vec::new(), strings: Vec::new(), hashes: Vec::new(), counter: 0 };
+}
+
+// A1: scalar field assignment through &Store.
+fn a1_scalar(s: &Store) {
+    s.counter = 41;
+}
+
+// A2: Vec push through &Store.
+fn a2_push(s: &Store) {
+    s.entries.push(Entry { key: mkbytes4(107, 101, 121, 49), kind: 1, expire_ms: 0, payload: 0 });
+    s.strings.push(mkbytes4(118, 97, 108, 49));
+    s.hashes.push(HashVal { fields: Vec::new(), values: Vec::new() });
+}
+
+// A3: index-path nested scalar assign through &Store.
+fn a3_nested_scalar(s: &Store) {
+    s.entries[0].expire_ms = 99000;
+}
+
+// A4: index-path nested Vec push through &Store.
+fn a4_nested_push(s: &Store) {
+    s.hashes[0].fields.push(mkbytes4(102, 105, 101, 108));
+    s.hashes[0].values.push(mkbytes4(118, 97, 108, 120));
+}
+
+// A5: whole-element replace through &Store (rebuild key by copying).
+fn a5_replace(s: &Store) {
+    let nk: Vec<u8> = Vec::new();
+    let i: u64 = 0;
+    while i < len(s.entries[0].key) {
+        nk.push(s.entries[0].key[i]);
+        i = i + 1;
+    }
+    s.entries[0] = Entry { key: nk, kind: 2, expire_ms: 5, payload: 7 };
+}
+
+fn bytes_eq(a: &Vec<u8>, b: &Vec<u8>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    };
+    let i: u64 = 0;
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn worker(shared: Arc<Mutex<Store> >, n: i64) -> i64 {
+    let i: i64 = 0;
+    while i < n {
+        let g = (*shared).lock().unwrap();
+        (*g).counter = (*g).counter + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+fn main() -> i32 {
+    // ---- Stage A: &Store mutation shapes (single-threaded) ----
+    let st = store_new();
+    a1_scalar(&st);
+    if st.counter != 41 {
+        return 101;
+    };
+    a2_push(&st);
+    if len(st.entries) != 1 {
+        return 102;
+    };
+    a3_nested_scalar(&st);
+    if st.entries[0].expire_ms != 99000 {
+        return 103;
+    };
+    a4_nested_push(&st);
+    if len(st.hashes[0].fields) != 1 {
+        return 104;
+    };
+    if bytes_eq(&st.hashes[0].values[0], &mkbytes4(118, 97, 108, 120)) != true {
+        return 105;
+    };
+    a5_replace(&st);
+    if st.entries[0].kind != 2 {
+        return 106;
+    };
+    if st.entries[0].payload != 7 {
+        return 107;
+    };
+    say(65);
+
+    // ---- Stage C: clock sanity ----
+    let now_ms: i64 = sa_time_unix_ms();
+    if now_ms < 1700000000000 {
+        return 108;
+    };
+    say(67);
+
+    // ---- Stage B: Arc<Mutex<Store>> across spawned threads ----
+    let shared: Arc<Mutex<Store> > = Arc::new(Mutex::new(store_new()));
+    let c1 = shared.clone();
+    let c2 = shared.clone();
+    let h1 = thread::spawn(^|| worker(c1, 5000));
+    let h2 = thread::spawn(^|| worker(c2, 5000));
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+    if r1 != 5000 {
+        return 109;
+    };
+    if r2 != 5000 {
+        return 110;
+    };
+    let g = (*shared).lock().unwrap();
+    if (*g).counter != 10000 {
+        return 111;
+    };
+    say(66);
+
+    // ---- Stage D: TCP roundtrip driven by the Python probe client ----
+    let listener: u64 = 0;
+    let bound: u32 = 0;
+    let lst: i32 = sa_std_net_tcp_listen(STR_PTR("127.0.0.1"), STR_LEN("127.0.0.1"), 7799, &listener, &bound);
+    if lst != SA_STD_OK {
+        return 112;
+    };
+    say(76);
+    let stream: u64 = 0;
+    let ast: i32 = sa_std_net_tcp_accept(listener, &stream);
+    if ast != SA_STD_OK {
+        return 113;
+    };
+    // accumulate until we hold "PING\r\n" (6 bytes) or EOF
+    let got: Vec<u8> = Vec::new();
+    let eof_seen: bool = false;
+    while len(got) < 6 && eof_seen != true {
+        let buf: [u8; 4096] = [0u8; 4096];
+        let bp: ptr = PTR_BYTE_ADD(&buf, 0);
+        let nread: u64 = 0;
+        let rst: i32 = sa_std_net_tcp_stream_read(stream, bp, 4096, &nread);
+        if rst != SA_STD_OK {
+            return 114;
+        };
+        if nread == 0 {
+            eof_seen = true;
+        } else {
+            let i: u64 = 0;
+            while i < nread {
+                got.push(buf[i]);
+                i = i + 1;
+            }
+        };
+    }
+    let expect = mkbytes4(80, 73, 78, 71);
+    if len(got) != 6 {
+        return 115;
+    };
+    if got[0] != 80 {
+        return 116;
+    };
+    if got[4] != 13 {
+        return 117;
+    };
+    // reply "+PONG\r\n"
+    let out: [u8; 8] = [0u8; 8];
+    out[0] = 43;
+    out[1] = 80;
+    out[2] = 79;
+    out[3] = 78;
+    out[4] = 71;
+    out[5] = 13;
+    out[6] = 10;
+    let op: ptr = PTR_BYTE_ADD(&out, 0);
+    let written: u64 = 0;
+    let wst: i32 = sa_std_net_tcp_stream_write(stream, op, 7, &written);
+    if wst != SA_STD_OK {
+        return 118;
+    };
+    if written != 7 {
+        return 119;
+    };
+    // next read must report EOF (client half-closes after reading reply)
+    let buf2: [u8; 64] = [0u8; 64];
+    let bp2: ptr = PTR_BYTE_ADD(&buf2, 0);
+    let n2: u64 = 0;
+    let rst2: i32 = sa_std_net_tcp_stream_read(stream, bp2, 64, &n2);
+    if rst2 != SA_STD_OK {
+        return 120;
+    };
+    if n2 != 0 {
+        return 121;
+    };
+    say(84);
+    let cst: i32 = sa_std_close(stream);
+    if cst != SA_STD_OK {
+        return 122;
+    };
+    let clst: i32 = sa_std_close(listener);
+    say(68);
+    return 0;
+}

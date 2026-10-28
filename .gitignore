@@ -1,0 +1,11 @@
+# build byproducts
+src/main
+src/main.sa
+src/main.sa.bc
+.sla-cache/
+.sa_cache/
+*.log
+probes/probe_loop
+probes/*.sa
+probes/*.bc
+__pycache__/

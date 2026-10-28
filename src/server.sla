@@ -1,0 +1,268 @@
+// server.sla -- connection table + the event loop.
+//
+// Concurrency model (decided on measured evidence, recorded in
+// docs/M0_DELIVERY.md): ONE process, ONE thread, a round-robin loop
+// over nonblocking sockets -- the same shape as Redis itself, so a
+// command always executes atomically and the store needs no lock.
+// The loop: drain pending accepts, then for each connection pump
+// one read chunk, execute every complete command in its buffer,
+// flush its out buffer, and reap connections that are done. The
+// expiry sweeper runs inside the loop every ~100 ms. A round with
+// no progress sleeps 1 ms instead of spinning.
+//
+// Measured std semantics this relies on (probe_loop, 2026-10-28):
+// a would-block accept or read returns SA_STD_ERR_IO (6), NOT
+// SA_STD_OK; end-of-file is SA_STD_OK with out_read == 0. Any
+// non-OK read status is therefore "no data this round"; a dead
+// connection still terminates via EOF on a later round or a failed
+// flush followed by EOF.
+@import "sa_std/net.sai"
+@import "sa_std/time.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/status.sla"
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/thread.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+@import "store.sla"
+@import "resp.sla"
+@import "commands.sla"
+
+struct Conn {
+    stream: u64,
+    inbuf: Vec<u8>,
+    inoff: u64,
+    outbuf: Vec<u8>,
+    outoff: u64,
+    open: bool,
+    eof: bool,
+    close_after_flush: bool,
+}
+
+fn conn_new(stream: u64) -> Conn {
+    return Conn {
+        stream: stream,
+        inbuf: Vec::new(),
+        inoff: 0,
+        outbuf: Vec::new(),
+        outoff: 0,
+        open: true,
+        eof: false,
+        close_after_flush: false,
+    };
+}
+
+// One read pump on conns[i]. Returns true when bytes arrived.
+fn conn_read(conns: &Vec<Conn>, i: u64) -> bool {
+    if conns[i].eof {
+        return false;
+    };
+    let buf: [u8; 4096] = [0u8; 4096];
+    let bp: ptr = PTR_BYTE_ADD(&buf, 0);
+    let nread: u64 = 0;
+    let st: i32 = sa_std_net_tcp_stream_read(conns[i].stream, bp, 4096, &nread);
+    if st != SA_STD_OK {
+        return false;
+    };
+    if nread == 0 {
+        conns[i].eof = true;
+        return false;
+    };
+    let j: u64 = 0;
+    while j < nread {
+        conns[i].inbuf.push(buf[j]);
+        j = j + 1;
+    }
+    return true;
+}
+
+// Execute every complete command buffered on conns[i], appending
+// replies to its out buffer. Returns true when a command ran.
+fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64) -> bool {
+    let ran: bool = false;
+    while conns[i].inoff < len(conns[i].inbuf) {
+        let pr = resp_parse(&conns[i].inbuf, conns[i].inoff);
+        if pr.state == PARSE_INCOMPLETE {
+            break;
+        };
+        if pr.state == PARSE_ERROR {
+            let ob_err = conns[i].outbuf;
+            conns[i].outbuf = resp_error(ob_err, STR_PTR("ERR Protocol error"), STR_LEN("ERR Protocol error"));
+            conns[i].close_after_flush = true;
+            conns[i].inoff = len(conns[i].inbuf);
+            break;
+        };
+        conns[i].inoff = conns[i].inoff + pr.consumed;
+        if pr.state == PARSE_OK {
+            // value-threaded reply buffer: move the field out, run
+            // the command, assign the buffer back (probe S6 shape)
+            let ob = conns[i].outbuf;
+            conns[i].outbuf = exec_command(s, &pr.args, now_ms, ob);
+            ran = true;
+        };
+    }
+    // compact the input buffer: drop the consumed prefix
+    if conns[i].inoff == len(conns[i].inbuf) {
+        conns[i].inbuf = Vec::new();
+        conns[i].inoff = 0;
+    } else {
+        if conns[i].inoff >= 8192 {
+            let rest: Vec<u8> = Vec::new();
+            let rest2 = bytes_push_range(rest, &conns[i].inbuf, conns[i].inoff, len(conns[i].inbuf));
+            conns[i].inbuf = rest2;
+            conns[i].inoff = 0;
+        };
+    };
+    return ran;
+}
+
+// One write flush on conns[i]. Returns true when bytes were sent.
+fn conn_flush(conns: &Vec<Conn>, i: u64) -> bool {
+    if conns[i].outoff >= len(conns[i].outbuf) {
+        return false;
+    };
+    let avail: u64 = len(conns[i].outbuf) - conns[i].outoff;
+    let chunk: u64 = avail;
+    if chunk > 4096 {
+        chunk = 4096;
+    };
+    let arr: [u8; 4096] = [0u8; 4096];
+    let j: u64 = 0;
+    while j < chunk {
+        arr[j] = conns[i].outbuf[conns[i].outoff + j];
+        j = j + 1;
+    }
+    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    let written: u64 = 0;
+    let st: i32 = sa_std_net_tcp_stream_write(conns[i].stream, ap, chunk, &written);
+    if st != SA_STD_OK {
+        return false;
+    };
+    if written == 0 {
+        return false;
+    };
+    conns[i].outoff = conns[i].outoff + written;
+    if conns[i].outoff == len(conns[i].outbuf) {
+        conns[i].outbuf = Vec::new();
+        conns[i].outoff = 0;
+    };
+    return true;
+}
+
+fn conn_drained(conns: &Vec<Conn>, i: u64) -> bool {
+    if conns[i].outoff == 0 {
+        if len(conns[i].outbuf) == 0 {
+            return true;
+        };
+    };
+    return false;
+}
+
+// Run forever; returns only on setup failure (exit-code contract
+// documented in README.md).
+fn run_server(s: &Store, host: Vec<u8>, port: u32) -> i32 {
+    if len(host) > 63 {
+        return 65;
+    };
+    let harr: [u8; 64] = [0u8; 64];
+    let hi: u64 = 0;
+    while hi < len(host) {
+        harr[hi] = host[hi];
+        hi = hi + 1;
+    }
+    let hp: ptr = PTR_BYTE_ADD(&harr, 0);
+    let listener: u64 = 0;
+    let bound: u32 = 0;
+    let lst: i32 = sa_std_net_tcp_listen(hp, len(host), port, &listener, &bound);
+    if lst != SA_STD_OK {
+        return 66;
+    };
+    let nbl: i32 = sa_std_net_tcp_listener_set_nonblocking(listener, 1);
+    if nbl != SA_STD_OK {
+        return 67;
+    };
+    let conns: Vec<Conn> = Vec::new();
+    let last_sweep: i64 = sa_time_unix_ms();
+    while true {
+        let progress: bool = false;
+        // drain pending accepts (bounded per round)
+        let accepts: i64 = 0;
+        while accepts < 64 {
+            let h: u64 = 0;
+            let ast: i32 = sa_std_net_tcp_accept(listener, &h);
+            if ast != SA_STD_OK {
+                break;
+            };
+            if h == 0 {
+                break;
+            };
+            let nb: i32 = sa_std_net_tcp_stream_set_nonblocking(h, 1);
+            conns.push(conn_new(h));
+            progress = true;
+            accepts = accepts + 1;
+        }
+        let now_ms: i64 = sa_time_unix_ms();
+        let ci: u64 = 0;
+        while ci < len(conns) {
+            if conns[ci].open {
+                if conn_read(&conns, ci) {
+                    progress = true;
+                };
+                if conn_exec_all(s, &conns, ci, now_ms) {
+                    progress = true;
+                };
+                if conn_flush(&conns, ci) {
+                    progress = true;
+                };
+                if conn_drained(&conns, ci) {
+                    if conns[ci].eof || conns[ci].close_after_flush {
+                        let cc: i32 = sa_std_close(conns[ci].stream);
+                        conns[ci].open = false;
+                    };
+                };
+            };
+            ci = ci + 1;
+        }
+        // reap closed connection slots when they pile up
+        if len(conns) >= 256 {
+            let closed: u64 = 0;
+            let k: u64 = 0;
+            while k < len(conns) {
+                if conns[k].open != true {
+                    closed = closed + 1;
+                };
+                k = k + 1;
+            }
+            if closed * 2 >= len(conns) {
+                let fresh: Vec<Conn> = Vec::new();
+                let m: u64 = 0;
+                while m < len(conns) {
+                    if conns[m].open {
+                        fresh.push(Conn {
+                            stream: conns[m].stream,
+                            inbuf: bytes_clone(&conns[m].inbuf),
+                            inoff: conns[m].inoff,
+                            outbuf: bytes_clone(&conns[m].outbuf),
+                            outoff: conns[m].outoff,
+                            open: true,
+                            eof: conns[m].eof,
+                            close_after_flush: conns[m].close_after_flush,
+                        });
+                    };
+                    m = m + 1;
+                }
+                conns = fresh;
+            };
+        };
+        if now_ms - last_sweep >= 100 {
+            let swept: u64 = store_sweep(s, now_ms);
+            last_sweep = now_ms;
+        };
+        if progress != true {
+            THREAD_SLEEP_MS(1);
+        };
+    }
+    return 0;
+}

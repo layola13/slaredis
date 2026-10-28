@@ -1,0 +1,140 @@
+ok   PING raw bytes
+ok   PING msg
+ok   PING lowercase
+ok   ECHO
+ok   SET
+ok   GET raw bytes
+ok   GET missing raw nil
+ok   TYPE string
+ok   TYPE none
+ok   EXISTS dup counts
+ok   DEL count
+ok   EXISTS after DEL
+ok   GET arity
+ok   unknown command
+ok   SET arity
+ok   INCR fresh
+ok   INCR again
+ok   DECR
+ok   INCR on 10
+ok   INCR on abc
+ok   INCR overflow
+ok   INCR on float text
+ok   INCR leading zeros rejected
+ok   INCR value
+ok   INCR preserves TTL
+ok   TTL missing = -2
+ok   TTL no-expire = -1
+ok   PERSIST no-expire = 0
+ok   EXPIRE set
+ok   TTL ~100
+ok   PTTL ~100000
+ok   PERSIST removes
+ok   TTL after PERSIST = -1
+ok   EXPIRE missing = 0
+ok   EXPIRE non-integer
+ok   EXPIRE 0 deletes
+ok   EXPIRE 0 gone
+ok   SET EX 0
+ok   SET EX abc
+ok   SET EX+PX conflict
+ok   SET bad option
+ok   SET overwrite clears TTL
+ok   SET EX 1
+ok   EX 1 alive immediately
+ok   EX 1 gone after 1.4s (lazy)
+ok   EX 1 type none after expiry
+ok   SET PX 400
+ok   PX alive immediately
+ok   PX gone after 0.7s
+ok   HSET two new
+ok   HSET one new one update
+ok   HGET updated
+ok   HGET missing field
+ok   HGETALL
+ok   HDEL count
+ok   TYPE hash
+ok   HSET odd args
+ok   HDEL rest
+ok   hash key deleted when emptied
+ok   HGETALL missing = empty array
+ok   RPUSH len
+ok   LPUSH len
+ok   LRANGE all
+ok   LRANGE negative
+ok   LRANGE out of range
+ok   LRANGE non-integer
+ok   LLEN
+ok   LPOP single
+ok   RPOP count
+ok   LPOP count 0 = empty array
+ok   LPOP negative count
+ok   LPOP missing = nil
+ok   RPOP single
+ok   LPOP last
+ok   list key deleted when emptied
+ok   TYPE after empty = none
+ok   SADD dup in one call
+ok   SADD one new
+ok   SISMEMBER yes
+ok   SISMEMBER no
+ok   SMEMBERS content
+ok   SREM count
+ok   TYPE set
+ok   SREM rest
+ok   set key deleted when emptied
+ok   SMEMBERS missing = empty array
+ok   ZADD three new
+ok   ZADD update not counted
+ok   ZSCORE updated
+ok   ZSCORE fraction format
+ok   ZSCORE missing member
+ok   ZRANGE order
+ok   ZRANGE withscores
+ok   ZADD tie member
+ok   ZRANGE tie lexicographic
+ok   ZADD bad score
+ok   ZADD bad score applied nothing (no x key)
+ok   ZADD bad score added no member
+ok   ZADD nan rejected
+ok   ZADD inf accepted
+ok   ZSCORE inf format
+ok   ZRANGE last is inf member
+ok   ZREM count
+ok   TYPE zset
+ok   ZRANGE bad option
+ok   ZADD extreme score
+ok   ZSCORE extreme round-trips
+ok   ZRANGE extreme order
+ok   WRONGTYPE: GET on list
+ok   WRONGTYPE: GET on hash
+ok   WRONGTYPE: INCR on set
+ok   WRONGTYPE: LPUSH on string
+ok   WRONGTYPE: LRANGE on zset
+ok   WRONGTYPE: LLEN on string
+ok   WRONGTYPE: HSET on list
+ok   WRONGTYPE: HGET on string
+ok   WRONGTYPE: HGETALL on set
+ok   WRONGTYPE: SADD on hash
+ok   WRONGTYPE: SMEMBERS on string
+ok   WRONGTYPE: SISMEMBER on list
+ok   WRONGTYPE: ZADD on set
+ok   WRONGTYPE: ZSCORE on string
+ok   WRONGTYPE: ZREM on hash
+ok   WRONGTYPE: LPOP on zset
+ok   WRONGTYPE raw bytes
+ok   inline PING
+ok   inline SET padded spaces
+ok   inline GET
+ok   fragmented multibulk completes
+ok   pipeline batch
+ok   protocol error reply
+ok   protocol error closes connection
+ok   PX key gone after window with traffic flowing
+ok   traffic flowed during sweep window
+ok   concurrent workers clean
+ok   shared INCR total = 4*250
+ok   private counters all 200
+----
+checks: 137, failures: 0
+ALL PASS

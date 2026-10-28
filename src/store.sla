@@ -1,0 +1,208 @@
+// store.sla -- the slaredis keyspace.
+//
+// Representation (M0, deliberately standard -- see README):
+//   One Entry per key in a single Vec, found by linear scan with an
+//   FNV-1a pre-filter. All payloads live inline in the Entry as
+//   Vec<u8> byte strings / Vec pairs; there are no compact encodings
+//   (listpack/intset/skiplist) yet -- those are the documented M0
+//   simplification, not a hidden one.
+//   Deletion and expiry tombstone the entry (kind = KIND_DEAD,
+//   payloads released); insert reuses dead slots, and the sweeper
+//   compacts when tombstones dominate.
+//
+// Expiry: expire_ms is a unix-ms deadline, 0 = no expiry. Expiry is
+// enforced lazily inside store_find (an expired key is tombstoned
+// and reported missing) and actively by store_sweep from the server
+// loop.
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+
+const KIND_DEAD: u8 = 0;
+const KIND_STRING: u8 = 1;
+const KIND_HASH: u8 = 2;
+const KIND_LIST: u8 = 3;
+const KIND_SET: u8 = 4;
+const KIND_ZSET: u8 = 5;
+
+// One sorted-set row. Scores live in a struct field because bare
+// Vec<f64> element reads return 0.0 with the current toolchain
+// (minimal repro in docs/M0_DELIVERY.md); struct-field f64 access
+// is verified correct.
+struct ZRow {
+    member: Vec<u8>,
+    score: f64,
+}
+
+struct Entry {
+    key: Vec<u8>,
+    key_hash: u64,
+    kind: u8,
+    expire_ms: i64,
+    sval: Vec<u8>,
+    hfields: Vec<Vec<u8>>,
+    hvalues: Vec<Vec<u8>>,
+    litems: Vec<Vec<u8>>,
+    smembers: Vec<Vec<u8>>,
+    zrows: Vec<ZRow>,
+}
+
+struct Store {
+    entries: Vec<Entry>,
+    dead_count: u64,
+}
+
+fn entry_blank(key: &Vec<u8>, key_hash: u64, kind: u8) -> Entry {
+    return Entry {
+        key: bytes_clone(key),
+        key_hash: key_hash,
+        kind: kind,
+        expire_ms: 0,
+        sval: Vec::new(),
+        hfields: Vec::new(),
+        hvalues: Vec::new(),
+        litems: Vec::new(),
+        smembers: Vec::new(),
+        zrows: Vec::new(),
+    };
+}
+
+fn store_new() -> Store {
+    return Store { entries: Vec::new(), dead_count: 0 };
+}
+
+// Release an entry's payloads and mark it dead. The key bytes are
+// kept (harmless; the slot is reused or compacted later).
+fn entry_tombstone(s: &Store, i: u64) {
+    if s.entries[i].kind == KIND_DEAD {
+        return;
+    };
+    s.entries[i].kind = KIND_DEAD;
+    s.entries[i].expire_ms = 0;
+    s.entries[i].sval = Vec::new();
+    s.entries[i].hfields = Vec::new();
+    s.entries[i].hvalues = Vec::new();
+    s.entries[i].litems = Vec::new();
+    s.entries[i].smembers = Vec::new();
+    s.entries[i].zrows = Vec::new();
+    s.dead_count = s.dead_count + 1;
+}
+
+// Reset a live entry in place to a new kind with empty payloads
+// and no expiry (SET overwriting an existing key uses this; the
+// slot stays live, unlike entry_tombstone).
+fn entry_reset(s: &Store, i: u64, kind: u8) {
+    s.entries[i].kind = kind;
+    s.entries[i].expire_ms = 0;
+    s.entries[i].sval = Vec::new();
+    s.entries[i].hfields = Vec::new();
+    s.entries[i].hvalues = Vec::new();
+    s.entries[i].litems = Vec::new();
+    s.entries[i].smembers = Vec::new();
+    s.entries[i].zrows = Vec::new();
+}
+
+fn entry_expired(s: &Store, i: u64, now_ms: i64) -> bool {
+    if s.entries[i].expire_ms == 0 {
+        return false;
+    };
+    if s.entries[i].expire_ms <= now_ms {
+        return true;
+    };
+    return false;
+}
+
+// Find a live entry by key. Applies lazy expiry: an expired entry
+// is tombstoned and reported missing. Returns the index or -1.
+fn store_find(s: &Store, key: &Vec<u8>, key_hash: u64, now_ms: i64) -> i64 {
+    let i: u64 = 0;
+    while i < len(s.entries) {
+        if s.entries[i].kind != KIND_DEAD {
+            if s.entries[i].key_hash == key_hash {
+                if bytes_eq(&s.entries[i].key, key) {
+                    if entry_expired(s, i, now_ms) {
+                        entry_tombstone(s, i);
+                        return -1;
+                    };
+                    return i as i64;
+                };
+            };
+        };
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Insert a fresh entry of the given kind (caller has verified the
+// key is absent). Reuses a tombstone slot when one exists.
+fn store_insert(s: &Store, key: &Vec<u8>, key_hash: u64, kind: u8) -> i64 {
+    let i: u64 = 0;
+    while i < len(s.entries) {
+        if s.entries[i].kind == KIND_DEAD {
+            s.entries[i] = entry_blank(key, key_hash, kind);
+            s.dead_count = s.dead_count - 1;
+            return i as i64;
+        };
+        i = i + 1;
+    }
+    s.entries.push(entry_blank(key, key_hash, kind));
+    return (len(s.entries) - 1) as i64;
+}
+
+// Active expiry sweep + tombstone compaction. Called periodically
+// from the server loop. Returns how many keys the sweep expired.
+fn store_sweep(s: &Store, now_ms: i64) -> u64 {
+    let removed: u64 = 0;
+    let i: u64 = 0;
+    while i < len(s.entries) {
+        if s.entries[i].kind != KIND_DEAD {
+            if entry_expired(s, i, now_ms) {
+                entry_tombstone(s, i);
+                removed = removed + 1;
+            };
+        };
+        i = i + 1;
+    }
+    // Compact when tombstones are at least half the table and
+    // non-trivial in number: rebuild with deep copies of live rows.
+    if s.dead_count >= 64 {
+        if s.dead_count * 2 >= len(s.entries) {
+            let fresh: Vec<Entry> = Vec::new();
+            let j: u64 = 0;
+            while j < len(s.entries) {
+                if s.entries[j].kind != KIND_DEAD {
+                    let e = entry_blank(&s.entries[j].key, s.entries[j].key_hash, s.entries[j].kind);
+                    e.expire_ms = s.entries[j].expire_ms;
+                    e.sval = bytes_clone(&s.entries[j].sval);
+                    let k: u64 = 0;
+                    while k < len(s.entries[j].hfields) {
+                        e.hfields.push(bytes_clone(&s.entries[j].hfields[k]));
+                        e.hvalues.push(bytes_clone(&s.entries[j].hvalues[k]));
+                        k = k + 1;
+                    }
+                    let m: u64 = 0;
+                    while m < len(s.entries[j].litems) {
+                        e.litems.push(bytes_clone(&s.entries[j].litems[m]));
+                        m = m + 1;
+                    }
+                    let q: u64 = 0;
+                    while q < len(s.entries[j].smembers) {
+                        e.smembers.push(bytes_clone(&s.entries[j].smembers[q]));
+                        q = q + 1;
+                    }
+                    let z: u64 = 0;
+                    while z < len(s.entries[j].zrows) {
+                        e.zrows.push(ZRow { member: bytes_clone(&s.entries[j].zrows[z].member), score: s.entries[j].zrows[z].score });
+                        z = z + 1;
+                    }
+                    fresh.push(e);
+                };
+                j = j + 1;
+            }
+            s.entries = fresh;
+            s.dead_count = 0;
+        };
+    };
+    return removed;
+}

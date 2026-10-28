@@ -1,0 +1,16 @@
+// REPRO: a Vec reassigned from a value-threaded call
+// (tmp = app(tmp, ...)) and then passed by reference together
+// with its length into a second call loses its elements inside
+// that call: copy_range sees length 0 and copies nothing.
+// Expected: main returns 1. Actual (sa 0.1.8, sla 59cbcfa8): 0.
+// Controls (both return 1): building tmp with tmp.push(51)
+// instead of the threaded call; binding the call result to a
+// fresh variable (let tmp2 = app(tmp, ...)). Reading len(tmp)
+// directly in probe also yields 1 -- only the by-ref + length
+// copy into the next call observes the loss. slaredis avoids
+// the shape (fmt_f64 appends directly onto its out buffer).
+@import "sa_std/vec.sa"
+fn app(out: Vec<u8>, v: i64) -> Vec<u8> { out.push((48 + v) as u8); return out; }
+fn copy_range(out: Vec<u8>, src: &Vec<u8>, from: u64, to: u64) -> Vec<u8> { let i: u64 = from; while i < to { out.push(src[i]); i = i + 1; } return out; }
+fn probe(v: i64) -> i32 { let out: Vec<u8> = Vec::new(); let tmp: Vec<u8> = Vec::new(); tmp = app(tmp, v); out = copy_range(out, &tmp, 0, len(tmp)); return len(out) as i32; }
+fn main() -> i32 { return probe(3); }

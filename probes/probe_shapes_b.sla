@@ -1,0 +1,77 @@
+// probe_shapes.sla -- BN line risk probe #3 (not part of the product).
+// Pins the exact referee boundary for Vec pushes in loops:
+//   S1 borrowed &Vec<u8> param, push a constant in a loop
+//   S2 borrowed &Vec<u8> param, push src[i] in a loop
+//   S3 &Store param, push into a nested entry field in a loop
+//   S4 value-threaded Vec (in by move, out by return), push in loop
+//   S5 move a Vec field out of a Vec element and assign it back
+//   S6 S5 + value-threaded transform in between (server merge shape)
+// Exit codes: 0 = all pass; 100+stage = first failure. Each stage is
+// exercised for real in main (reachability matters: dead functions
+// are eliminated before verification).
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/core/slice.sa"
+
+struct Entry { key: Vec<u8>, smembers: Vec<Vec<u8>> }
+struct Store { entries: Vec<Entry> }
+struct Conn { outbuf: Vec<u8>, open: bool }
+
+fn mk1(b: u8) -> Vec<u8> {
+    let v: Vec<u8> = Vec::new();
+    v.push(b);
+    return v;
+}
+
+fn s3_loop_push_store(s: &Store, n: u64) {
+    let i: u64 = 0;
+    while i < n {
+        s.entries[0].smembers.push(mk1(77));
+        i = i + 1;
+    }
+}
+
+fn s4_threaded(out: Vec<u8>, n: u64) -> Vec<u8> {
+    let i: u64 = 0;
+    while i < n {
+        out.push(66);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn s5_move_field(conns: &Vec<Conn>) {
+    let ob = conns[0].outbuf;
+    conns[0].outbuf = ob;
+}
+
+fn s6_move_transform(conns: &Vec<Conn>, n: u64) {
+    let ob = conns[0].outbuf;
+    let ob2 = s4_threaded(ob, n);
+    conns[0].outbuf = ob2;
+}
+
+fn main() -> i32 {
+    // S3
+    let st = Store { entries: Vec::new() };
+    st.entries.push(Entry { key: mk1(107), smembers: Vec::new() });
+    s3_loop_push_store(&st, 4);
+    if len(st.entries[0].smembers) != 4 {
+        return 103;
+    };
+    // S4
+    let v4: Vec<u8> = Vec::new();
+    v4 = s4_threaded(v4, 5);
+    if len(v4) != 5 {
+        return 104;
+    };
+    // S5 + S6
+    let conns: Vec<Conn> = Vec::new();
+    conns.push(Conn { outbuf: Vec::new(), open: true });
+    s5_move_field(&conns);
+    s6_move_transform(&conns, 6);
+    if len(conns[0].outbuf) != 6 {
+        return 105;
+    };
+    return 0;
+}

@@ -1,0 +1,8 @@
+// REPRO: an unsuffixed integer literal larger than i64::MAX is
+// rejected by the parser with error.InvalidCharacter (literals
+// are parsed as i64). In an @imported file the same failure is
+// misreported as "Import Error: failed to expand @import SLA
+// sources". The suffixed form 14695981039346656037u64 parses.
+// FNV-1a's 64-bit offset basis needs the suffix (bytes.sla).
+@import "sa_std/vec.sa"
+fn main() -> i32 { let x: u64 = 14695981039346656037; if x > 0 { return 1; }; return 0; }
