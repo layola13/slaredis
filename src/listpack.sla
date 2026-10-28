@@ -1,0 +1,404 @@
+// listpack.sla -- the Redis listpack compact encoding, implemented
+// on a plain Vec<u8>.
+//
+// Layout (byte-compatible with Redis's listpack):
+//   [0..4)  total bytes, u32 little-endian (header + entries + end)
+//   [4..6)  element count, u16 little-endian (exact; our callers cap
+//           the logical element count far below 65535)
+//   [6..)   entries, then one end byte 0xFF
+// Each entry is an encoding followed by a "backlen": the length of
+// the encoding itself (header + payload, backlen excluded), stored
+// in 7-bit groups, most significant group first WITHOUT the high
+// bit, remaining groups WITH the high bit set -- so an entry's
+// length can be recovered scanning backwards from its end.
+// Encodings (first byte):
+//   0xxxxxxx                    7-bit unsigned int (0..127)
+//   10xxxxxx <bytes>            string, 6-bit length (0..63)
+//   110xxxxx xxxxxxxx           13-bit signed int
+//   1110xxxx xxxxxxxx <bytes>   string, 12-bit length (0..4095)
+//   11110000 <2 LE>             16-bit signed int
+//   11110001 <3 LE>             24-bit signed int
+//   11110010 <4 LE>             32-bit signed int
+//   11110011 <8 LE>             64-bit signed int
+//   11110100 <4 LE> <bytes>     string, 32-bit length
+// An element whose bytes parse as a strict Redis integer (the
+// string2l rules in bytes.sla) is stored in the smallest integer
+// encoding that holds it; anything else is a string. Decoding an
+// integer element yields its canonical decimal bytes, so "007"
+// (not a strict integer) round-trips as a string while "42" comes
+// back as "42" through the integer path -- the same contract Redis
+// gives.
+//
+// All mutations are value-threaded rebuilds (the codebase idiom --
+// pushing into a borrowed Vec inside a loop is a referee
+// PhiStateConflict). Packs are small by construction (callers
+// convert to the standard representation past 128 logical elements
+// or 64-byte elements), so a rebuild per mutation is cheap.
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+
+const LP_HEADER_LEN: u64 = 6;
+const LP_END_BYTE: u8 = 255;
+
+fn lp_new() -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    let i: u64 = 0;
+    while i < LP_HEADER_LEN {
+        out.push(0);
+        i = i + 1;
+    }
+    out.push(LP_END_BYTE);
+    return lp_patch_header(out, 0);
+}
+
+fn lp_total(lp: &Vec<u8>) -> u64 {
+    let t: u64 = (lp[0] as u64) | ((lp[1] as u64) << 8) | ((lp[2] as u64) << 16) | ((lp[3] as u64) << 24);
+    return t;
+}
+
+fn lp_count(lp: &Vec<u8>) -> u64 {
+    let c: u64 = (lp[4] as u64) | ((lp[5] as u64) << 8);
+    return c;
+}
+
+// Patch the header of a fully built pack (body + end byte present)
+// with its true total length and element count.
+fn lp_patch_header(out: Vec<u8>, count: u64) -> Vec<u8> {
+    let total: u64 = len(out);
+    out[0] = (total & 255) as u8;
+    out[1] = ((total >> 8) & 255) as u8;
+    out[2] = ((total >> 16) & 255) as u8;
+    out[3] = ((total >> 24) & 255) as u8;
+    out[4] = (count & 255) as u8;
+    out[5] = ((count >> 8) & 255) as u8;
+    return out;
+}
+
+// Number of bytes the backlen of an entry with encoding length
+// `enc_len` occupies: one 7-bit group per byte.
+fn lp_backlen_size(enc_len: u64) -> u64 {
+    let n: u64 = 1;
+    let t: u64 = enc_len >> 7;
+    while t > 0 {
+        n = n + 1;
+        t = t >> 7;
+    }
+    return n;
+}
+
+// Append the backlen for `enc_len` to out.
+fn lp_push_backlen(out: Vec<u8>, enc_len: u64) -> Vec<u8> {
+    let n: u64 = lp_backlen_size(enc_len);
+    // groups[] holds the 7-bit groups, least significant first.
+    let groups: [u8; 5] = [0u8; 5];
+    let t: u64 = enc_len;
+    let gi: u64 = 0;
+    while gi < n {
+        groups[gi] = (t & 127) as u8;
+        t = t >> 7;
+        gi = gi + 1;
+    }
+    // Emit most significant group first (plain), the rest with the
+    // high bit set.
+    let k: u64 = 0;
+    while k < n {
+        let g: u8 = groups[n - 1 - k];
+        if k == 0 {
+            out.push(g);
+        } else {
+            out.push(g | 128);
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+// Append one element (encoding + backlen) to out.
+fn lp_entry_encoded(out: Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
+    let (is_int, iv) = parse_i64_full(data);
+    if is_int {
+        if iv >= 0 {
+            if iv <= 127 {
+                out.push(iv as u8);
+                return lp_push_backlen(out, 1);
+            };
+        };
+        if iv >= 0 - 4096 {
+            if iv <= 4095 {
+                let raw: i64 = iv;
+                if raw < 0 {
+                    raw = raw + 8192;
+                };
+                out.push(192 | ((raw >> 8) as u8));
+                out.push((raw & 255) as u8);
+                return lp_push_backlen(out, 2);
+            };
+        };
+        let u: u64 = iv as u64;
+        if iv >= 0 - 32768 {
+            if iv <= 32767 {
+                out.push(240);
+                out.push((u & 255) as u8);
+                out.push(((u >> 8) & 255) as u8);
+                return lp_push_backlen(out, 3);
+            };
+        };
+        if iv >= 0 - 8388608 {
+            if iv <= 8388607 {
+                out.push(241);
+                out.push((u & 255) as u8);
+                out.push(((u >> 8) & 255) as u8);
+                out.push(((u >> 16) & 255) as u8);
+                return lp_push_backlen(out, 4);
+            };
+        };
+        if iv >= 0 - 2147483647 - 1 {
+            if iv <= 2147483647 {
+                out.push(242);
+                let b: u64 = 0;
+                while b < 4 {
+                    out.push(((u >> (b * 8)) & 255) as u8);
+                    b = b + 1;
+                }
+                return lp_push_backlen(out, 5);
+            };
+        };
+        out.push(243);
+        let b2: u64 = 0;
+        while b2 < 8 {
+            out.push(((u >> (b2 * 8)) & 255) as u8);
+            b2 = b2 + 1;
+        }
+        return lp_push_backlen(out, 9);
+    };
+    let n: u64 = len(data);
+    if n <= 63 {
+        out.push(128 | (n as u8));
+        out = bytes_push_range(out, data, 0, n);
+        return lp_push_backlen(out, 1 + n);
+    };
+    if n <= 4095 {
+        out.push(224 | ((n >> 8) as u8));
+        out.push((n & 255) as u8);
+        out = bytes_push_range(out, data, 0, n);
+        return lp_push_backlen(out, 2 + n);
+    };
+    out.push(244);
+    let b3: u64 = 0;
+    while b3 < 4 {
+        out.push(((n >> (b3 * 8)) & 255) as u8);
+        b3 = b3 + 1;
+    }
+    out = bytes_push_range(out, data, 0, n);
+    return lp_push_backlen(out, 5 + n);
+}
+
+// Decoded view of the entry starting at `pos`.
+struct LpEntry {
+    is_int: bool,
+    int_val: i64,
+    str_off: u64,
+    str_len: u64,
+    enc_len: u64,
+}
+
+fn lp_decode(lp: &Vec<u8>, pos: u64) -> LpEntry {
+    let b0: u8 = lp[pos];
+    if b0 < 128 {
+        return LpEntry { is_int: true, int_val: b0 as i64, str_off: 0, str_len: 0, enc_len: 1 };
+    };
+    if b0 < 192 {
+        let n: u64 = (b0 & 63) as u64;
+        return LpEntry { is_int: false, int_val: 0, str_off: pos + 1, str_len: n, enc_len: 1 + n };
+    };
+    if b0 < 224 {
+        let raw: i64 = (((b0 & 31) as i64) << 8) | (lp[pos + 1] as i64);
+        let v: i64 = raw;
+        if raw >= 4096 {
+            v = raw - 8192;
+        };
+        return LpEntry { is_int: true, int_val: v, str_off: 0, str_len: 0, enc_len: 2 };
+    };
+    if b0 < 240 {
+        let n2: u64 = (((b0 & 15) as u64) << 8) | (lp[pos + 1] as u64);
+        return LpEntry { is_int: false, int_val: 0, str_off: pos + 2, str_len: n2, enc_len: 2 + n2 };
+    };
+    if b0 == 240 {
+        let u: i64 = (lp[pos + 1] as i64) | ((lp[pos + 2] as i64) << 8);
+        let v2: i64 = u;
+        if u >= 32768 {
+            v2 = u - 65536;
+        };
+        return LpEntry { is_int: true, int_val: v2, str_off: 0, str_len: 0, enc_len: 3 };
+    };
+    if b0 == 241 {
+        let u2: i64 = (lp[pos + 1] as i64) | ((lp[pos + 2] as i64) << 8) | ((lp[pos + 3] as i64) << 16);
+        let v3: i64 = u2;
+        if u2 >= 8388608 {
+            v3 = u2 - 16777216;
+        };
+        return LpEntry { is_int: true, int_val: v3, str_off: 0, str_len: 0, enc_len: 4 };
+    };
+    if b0 == 242 {
+        let u3: u64 = (lp[pos + 1] as u64) | ((lp[pos + 2] as u64) << 8) | ((lp[pos + 3] as u64) << 16) | ((lp[pos + 4] as u64) << 24);
+        // Sign-extend: the assembled u64 holds the unsigned 32-bit
+        // value, so negatives come from subtracting 2^32 (the u64
+        // subtraction wraps to the right two's-complement bits).
+        let v4: i64 = u3 as i64;
+        if u3 >= 2147483648 {
+            v4 = (u3 - 4294967296) as i64;
+        };
+        return LpEntry { is_int: true, int_val: v4, str_off: 0, str_len: 0, enc_len: 5 };
+    };
+    if b0 == 243 {
+        let u4: u64 = 0;
+        let b: u64 = 0;
+        while b < 8 {
+            u4 = u4 | ((lp[pos + 1 + b] as u64) << (b * 8));
+            b = b + 1;
+        }
+        return LpEntry { is_int: true, int_val: u4 as i64, str_off: 0, str_len: 0, enc_len: 9 };
+    };
+    if b0 == 244 {
+        let n3: u64 = (lp[pos + 1] as u64) | ((lp[pos + 2] as u64) << 8) | ((lp[pos + 3] as u64) << 16) | ((lp[pos + 4] as u64) << 24);
+        return LpEntry { is_int: false, int_val: 0, str_off: pos + 5, str_len: n3, enc_len: 5 + n3 };
+    };
+    // End byte or corrupt input: a zero-length string of enc_len 1
+    // keeps every scan terminating. Callers only pass positions
+    // this module produced, so this branch is defensive, and it is
+    // deliberately NOT a silent success path for stored data --
+    // lp_validate below is the integrity gate used by tests.
+    return LpEntry { is_int: false, int_val: 0, str_off: pos + 1, str_len: 0, enc_len: 1 };
+}
+
+// Full length (encoding + backlen) of the entry at `pos`.
+fn lp_elem_len(lp: &Vec<u8>, pos: u64) -> u64 {
+    let d = lp_decode(lp, pos);
+    return d.enc_len + lp_backlen_size(d.enc_len);
+}
+
+fn lp_next(lp: &Vec<u8>, pos: u64) -> u64 {
+    return pos + lp_elem_len(lp, pos);
+}
+
+// Position of the end byte (one past the last entry).
+fn lp_end_pos(lp: &Vec<u8>) -> u64 {
+    return lp_total(lp) - 1;
+}
+
+// Append the materialized value of the entry at `pos` to out
+// (integers render as canonical decimal).
+fn lp_value(lp: &Vec<u8>, pos: u64, out: Vec<u8>) -> Vec<u8> {
+    let d = lp_decode(lp, pos);
+    if d.is_int {
+        return append_i64(out, d.int_val);
+    };
+    return bytes_push_range(out, lp, d.str_off, d.str_off + d.str_len);
+}
+
+// Materialize the entry at `pos` into a fresh Vec.
+fn lp_value_new(lp: &Vec<u8>, pos: u64) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    return lp_value(lp, pos, out);
+}
+
+// Byte offset of the first element whose materialized value
+// equals `needle`, or -1.
+fn lp_find(lp: &Vec<u8>, needle: &Vec<u8>) -> i64 {
+    let count: u64 = lp_count(lp);
+    let pos: u64 = LP_HEADER_LEN;
+    let i: u64 = 0;
+    while i < count {
+        let v = lp_value_new(lp, pos);
+        if bytes_eq(&v, needle) {
+            return pos as i64;
+        };
+        pos = lp_next(lp, pos);
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Position of the n-th element (0-based); the end position when
+// n == count.
+fn lp_pos_of(lp: &Vec<u8>, n: u64) -> u64 {
+    let pos: u64 = LP_HEADER_LEN;
+    let i: u64 = 0;
+    while i < n {
+        pos = lp_next(lp, pos);
+        i = i + 1;
+    }
+    return pos;
+}
+
+// Structural integrity check used by the round-trip tests: the
+// header total must match the byte length, walking the entries
+// must land exactly on the end byte, and the walk count must
+// match the header count.
+fn lp_validate(lp: &Vec<u8>) -> bool {
+    if len(lp) < LP_HEADER_LEN + 1 {
+        return false;
+    };
+    if lp_total(lp) != len(lp) {
+        return false;
+    };
+    if lp[lp_total(lp) - 1] != LP_END_BYTE {
+        return false;
+    };
+    let count: u64 = lp_count(lp);
+    let pos: u64 = LP_HEADER_LEN;
+    let i: u64 = 0;
+    while i < count {
+        pos = lp_next(lp, pos);
+        i = i + 1;
+    }
+    if pos != lp_end_pos(lp) {
+        return false;
+    };
+    return true;
+}
+
+// Shared rebuild behind append/insert/replace/delete: the new
+// body is lp[6..from) + (optional new entry) + lp[to..end).
+fn lp_splice(lp: Vec<u8>, from: u64, to: u64, data: &Vec<u8>, with_data: bool, new_count: u64) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    let h: u64 = 0;
+    while h < LP_HEADER_LEN {
+        out.push(0);
+        h = h + 1;
+    }
+    let out2 = bytes_push_range(out, &lp, LP_HEADER_LEN, from);
+    if with_data {
+        out2 = lp_entry_encoded(out2, data);
+    };
+    let endpos: u64 = lp_total(&lp) - 1;
+    let out3 = bytes_push_range(out2, &lp, to, endpos);
+    out3.push(LP_END_BYTE);
+    return lp_patch_header(out3, new_count);
+}
+
+fn lp_append(lp: Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
+    let endpos: u64 = lp_total(&lp) - 1;
+    let count: u64 = lp_count(&lp);
+    return lp_splice(lp, endpos, endpos, data, true, count + 1);
+}
+
+fn lp_insert(lp: Vec<u8>, pos: u64, data: &Vec<u8>) -> Vec<u8> {
+    let count: u64 = lp_count(&lp);
+    return lp_splice(lp, pos, pos, data, true, count + 1);
+}
+
+fn lp_replace(lp: Vec<u8>, pos: u64, data: &Vec<u8>) -> Vec<u8> {
+    let count: u64 = lp_count(&lp);
+    let next: u64 = lp_next(&lp, pos);
+    return lp_splice(lp, pos, next, data, true, count);
+}
+
+fn lp_delete(lp: Vec<u8>, pos: u64) -> Vec<u8> {
+    let count: u64 = lp_count(&lp);
+    let next: u64 = lp_next(&lp, pos);
+    let empty: Vec<u8> = Vec::new();
+    return lp_splice(lp, pos, next, &empty, false, count - 1);
+}

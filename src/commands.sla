@@ -13,6 +13,7 @@
 @import "sa_std/core/slice.sa"
 @import "bytes.sla"
 @import "store.sla"
+@import "listpack.sla"
 @import "resp.sla"
 
 // ---- shared error + lookup helpers ----
@@ -81,6 +82,54 @@ fn lookup_or_create(s: &Store, key: &Vec<u8>, kind: u8, now_ms: i64) -> i64 {
         return idx;
     };
     return store_insert(s, key, bytes_hash(key), kind);
+}
+
+// lookup_or_create for aggregate kinds (hash / set / zset): a
+// freshly created key starts in the packed (listpack)
+// representation; the plain path above stays for lists.
+fn lookup_or_create_agg(s: &Store, key: &Vec<u8>, kind: u8, now_ms: i64) -> i64 {
+    let idx: i64 = lookup_typed(s, key, kind, now_ms);
+    if idx != -1 {
+        return idx;
+    };
+    let ni: i64 = store_insert(s, key, bytes_hash(key), kind);
+    entry_make_packed(s, ni as u64);
+    return ni;
+}
+
+// ---- packed (listpack) aggregate helpers ----
+// Hash and zset packs store flat (name, payload) element pairs;
+// set packs store bare members.
+
+// Byte offset of the name element of the pair named `name` in a
+// pair pack, or -1.
+fn pack_pair_pos(lp: &Vec<u8>, name: &Vec<u8>) -> i64 {
+    let count: u64 = lp_count(lp);
+    let pos: u64 = 6;
+    let i: u64 = 0;
+    while i < count {
+        let v = lp_value_new(lp, pos);
+        if bytes_eq(&v, name) {
+            return pos as i64;
+        };
+        pos = lp_next(lp, pos);
+        pos = lp_next(lp, pos);
+        i = i + 2;
+    }
+    return -1;
+}
+
+// True when any of args[from..] is longer than the packed
+// element-size threshold (an insert of it must convert first).
+fn pack_args_have_big(args: &Vec<Vec<u8>>, from: u64) -> bool {
+    let i: u64 = from;
+    while i < len(args) {
+        if len(args[i]) > PACK_MAX_ELEM_BYTES {
+            return true;
+        };
+        i = i + 1;
+    }
+    return false;
 }
 
 // Saturating now + delta_ms for expiry deadlines.
@@ -360,6 +409,69 @@ fn cmd_persist(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec
     return resp_int(out, 1);
 }
 
+// PEXPIREAT key unix-time-milliseconds: set an absolute expiry
+// deadline. This is the canonical expiry form the AOF journal
+// rewrites relative expiries into, so a replayed AOF reproduces
+// deadlines exactly instead of re-extending them.
+fn cmd_pexpireat(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 3 {
+        return err_arity(out, STR_PTR("pexpireat"), STR_LEN("pexpireat"));
+    };
+    let (ok, ms) = parse_i64_full(&args[2]);
+    if ok != true {
+        return err_not_int(out);
+    };
+    let idx: i64 = store_find(s, &args[1], bytes_hash(&args[1]), now_ms);
+    if idx < 0 {
+        return resp_int(out, 0);
+    };
+    if ms <= now_ms {
+        entry_tombstone(s, idx as u64);
+        return resp_int(out, 1);
+    };
+    s.entries[idx as u64].expire_ms = ms;
+    return resp_int(out, 1);
+}
+
+// OBJECT ENCODING key: report the value representation. This is
+// the observability hook the listpack conversion tests assert
+// against -- representation changes are never silent. Only the
+// ENCODING subcommand is implemented; anything else is an
+// explicit error, not a quiet no-op.
+fn cmd_object(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    if len(args) != 3 {
+        return err_arity(out, STR_PTR("object"), STR_LEN("object"));
+    };
+    if bytes_eq_lit_ci(&args[1], STR_PTR("ENCODING"), STR_LEN("ENCODING")) != true {
+        return resp_error(out, STR_PTR("ERR unsupported OBJECT subcommand: only ENCODING is implemented"), STR_LEN("ERR unsupported OBJECT subcommand: only ENCODING is implemented"));
+    };
+    let idx: i64 = store_find(s, &args[2], bytes_hash(&args[2]), now_ms);
+    if idx < 0 {
+        return resp_nil(out);
+    };
+    let e: u64 = idx as u64;
+    let kind: u8 = s.entries[e].kind;
+    let name: Vec<u8> = Vec::new();
+    if kind == KIND_STRING {
+        let n1 = bytes_push_lit(name, STR_PTR("raw"), STR_LEN("raw"));
+        return resp_bulk(out, &n1);
+    };
+    if kind == KIND_LIST {
+        let n2 = bytes_push_lit(name, STR_PTR("linkedlist"), STR_LEN("linkedlist"));
+        return resp_bulk(out, &n2);
+    };
+    if s.entries[e].enc == ENC_PACKED {
+        let n3 = bytes_push_lit(name, STR_PTR("listpack"), STR_LEN("listpack"));
+        return resp_bulk(out, &n3);
+    };
+    if kind == KIND_ZSET {
+        let n4 = bytes_push_lit(name, STR_PTR("skiplist"), STR_LEN("skiplist"));
+        return resp_bulk(out, &n4);
+    };
+    let n5 = bytes_push_lit(name, STR_PTR("hashtable"), STR_LEN("hashtable"));
+    return resp_bulk(out, &n5);
+}
+
 // ---- hash commands ----
 
 fn hash_field_index(s: &Store, e: u64, field: &Vec<u8>) -> i64 {
@@ -377,11 +489,61 @@ fn cmd_hset(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
     if len(args) < 4 || len(args) % 2 != 0 {
         return err_arity(out, STR_PTR("hset"), STR_LEN("hset"));
     };
-    let idx: i64 = lookup_or_create(s, &args[1], KIND_HASH, now_ms);
+    let idx: i64 = lookup_or_create_agg(s, &args[1], KIND_HASH, now_ms);
     if idx == -2 {
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        // Convert first when an inserted field/value is oversized
+        // or the genuinely-new fields would pass the element cap;
+        // otherwise apply the write inside the pack.
+        let convert: bool = pack_args_have_big(args, 2);
+        if convert != true {
+            let newf: u64 = 0;
+            let j: u64 = 2;
+            while j < len(args) {
+                if pack_pair_pos(&s.entries[e].pack, &args[j]) < 0 {
+                    let seen: bool = false;
+                    let k: u64 = 2;
+                    while k < j {
+                        if bytes_eq(&args[k], &args[j]) {
+                            seen = true;
+                        };
+                        k = k + 2;
+                    }
+                    if seen != true {
+                        newf = newf + 1;
+                    };
+                };
+                j = j + 2;
+            }
+            if pack_logical_count(s, e) + newf > PACK_MAX_LOGICAL {
+                convert = true;
+            };
+        };
+        if convert {
+            entry_convert_plain(s, e);
+        } else {
+            let addedp: i64 = 0;
+            let i2: u64 = 2;
+            while i2 < len(args) {
+                let fpos: i64 = pack_pair_pos(&s.entries[e].pack, &args[i2]);
+                if fpos >= 0 {
+                    let vpos: u64 = lp_next(&s.entries[e].pack, fpos as u64);
+                    let pk = s.entries[e].pack;
+                    s.entries[e].pack = lp_replace(pk, vpos, &args[i2 + 1]);
+                } else {
+                    let pk2 = s.entries[e].pack;
+                    let pk3 = lp_append(pk2, &args[i2]);
+                    s.entries[e].pack = lp_append(pk3, &args[i2 + 1]);
+                    addedp = addedp + 1;
+                };
+                i2 = i2 + 2;
+            }
+            return resp_int(out, addedp);
+        };
+    };
     let added: i64 = 0;
     let i: u64 = 2;
     while i < len(args) {
@@ -409,6 +571,15 @@ fn cmd_hget(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
     if idx == -2 {
         return err_wrongtype(out);
     };
+    if s.entries[idx as u64].enc == ENC_PACKED {
+        let fpos: i64 = pack_pair_pos(&s.entries[idx as u64].pack, &args[2]);
+        if fpos < 0 {
+            return resp_nil(out);
+        };
+        let vpos: u64 = lp_next(&s.entries[idx as u64].pack, fpos as u64);
+        let val = lp_value_new(&s.entries[idx as u64].pack, vpos);
+        return resp_bulk(out, &val);
+    };
     let fi: i64 = hash_field_index(s, idx as u64, &args[2]);
     if fi < 0 {
         return resp_nil(out);
@@ -428,6 +599,27 @@ fn cmd_hdel(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        let removedp: i64 = 0;
+        let i2: u64 = 2;
+        while i2 < len(args) {
+            let fpos: i64 = pack_pair_pos(&s.entries[e].pack, &args[i2]);
+            if fpos >= 0 {
+                // delete the payload element first so the field
+                // offset stays valid for the second delete
+                let vpos: u64 = lp_next(&s.entries[e].pack, fpos as u64);
+                let pk = s.entries[e].pack;
+                let pk2 = lp_delete(pk, vpos);
+                s.entries[e].pack = lp_delete(pk2, fpos as u64);
+                removedp = removedp + 1;
+            };
+            i2 = i2 + 1;
+        }
+        if lp_count(&s.entries[e].pack) == 0 {
+            entry_tombstone(s, e);
+        };
+        return resp_int(out, removedp);
+    };
     let removed: i64 = 0;
     let i: u64 = 2;
     while i < len(args) {
@@ -457,6 +649,20 @@ fn cmd_hgetall(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        // the pack's element count is exactly fields * 2
+        out = resp_array_header(out, lp_count(&s.entries[e].pack) as i64);
+        let pos: u64 = 6;
+        let n: u64 = lp_count(&s.entries[e].pack);
+        let i2: u64 = 0;
+        while i2 < n {
+            let v = lp_value_new(&s.entries[e].pack, pos);
+            out = resp_bulk(out, &v);
+            pos = lp_next(&s.entries[e].pack, pos);
+            i2 = i2 + 1;
+        }
+        return out;
+    };
     out = resp_array_header(out, (len(s.entries[e].hfields) * 2) as i64);
     let i: u64 = 0;
     while i < len(s.entries[e].hfields) {
@@ -683,11 +889,52 @@ fn cmd_sadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
     if len(args) < 3 {
         return err_arity(out, STR_PTR("sadd"), STR_LEN("sadd"));
     };
-    let idx: i64 = lookup_or_create(s, &args[1], KIND_SET, now_ms);
+    let idx: i64 = lookup_or_create_agg(s, &args[1], KIND_SET, now_ms);
     if idx == -2 {
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        let convert: bool = pack_args_have_big(args, 2);
+        if convert != true {
+            let newm: u64 = 0;
+            let j: u64 = 2;
+            while j < len(args) {
+                if lp_find(&s.entries[e].pack, &args[j]) < 0 {
+                    let seen: bool = false;
+                    let k: u64 = 2;
+                    while k < j {
+                        if bytes_eq(&args[k], &args[j]) {
+                            seen = true;
+                        };
+                        k = k + 1;
+                    }
+                    if seen != true {
+                        newm = newm + 1;
+                    };
+                };
+                j = j + 1;
+            }
+            if pack_logical_count(s, e) + newm > PACK_MAX_LOGICAL {
+                convert = true;
+            };
+        };
+        if convert {
+            entry_convert_plain(s, e);
+        } else {
+            let addedp: i64 = 0;
+            let i2: u64 = 2;
+            while i2 < len(args) {
+                if lp_find(&s.entries[e].pack, &args[i2]) < 0 {
+                    let pk = s.entries[e].pack;
+                    s.entries[e].pack = lp_append(pk, &args[i2]);
+                    addedp = addedp + 1;
+                };
+                i2 = i2 + 1;
+            }
+            return resp_int(out, addedp);
+        };
+    };
     let added: i64 = 0;
     let i: u64 = 2;
     while i < len(args) {
@@ -712,6 +959,23 @@ fn cmd_srem(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        let removedp: i64 = 0;
+        let i2: u64 = 2;
+        while i2 < len(args) {
+            let mpos: i64 = lp_find(&s.entries[e].pack, &args[i2]);
+            if mpos >= 0 {
+                let pk = s.entries[e].pack;
+                s.entries[e].pack = lp_delete(pk, mpos as u64);
+                removedp = removedp + 1;
+            };
+            i2 = i2 + 1;
+        }
+        if lp_count(&s.entries[e].pack) == 0 {
+            entry_tombstone(s, e);
+        };
+        return resp_int(out, removedp);
+    };
     let removed: i64 = 0;
     let i: u64 = 2;
     while i < len(args) {
@@ -740,6 +1004,19 @@ fn cmd_smembers(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Ve
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        out = resp_array_header(out, lp_count(&s.entries[e].pack) as i64);
+        let pos: u64 = 6;
+        let n: u64 = lp_count(&s.entries[e].pack);
+        let i2: u64 = 0;
+        while i2 < n {
+            let v = lp_value_new(&s.entries[e].pack, pos);
+            out = resp_bulk(out, &v);
+            pos = lp_next(&s.entries[e].pack, pos);
+            i2 = i2 + 1;
+        }
+        return out;
+    };
     out = resp_array_header(out, len(s.entries[e].smembers) as i64);
     let i: u64 = 0;
     while i < len(s.entries[e].smembers) {
@@ -759,6 +1036,12 @@ fn cmd_sismember(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> V
     };
     if idx == -2 {
         return err_wrongtype(out);
+    };
+    if s.entries[idx as u64].enc == ENC_PACKED {
+        if lp_find(&s.entries[idx as u64].pack, &args[2]) >= 0 {
+            return resp_int(out, 1);
+        };
+        return resp_int(out, 0);
     };
     if set_member_index(s, idx as u64, &args[2]) >= 0 {
         return resp_int(out, 1);
@@ -799,13 +1082,89 @@ fn bytes_lt(a: &Vec<u8>, b: &Vec<u8>) -> bool {
 
 // true when zset row x must sort before row y: score asc, then
 // member bytes asc (Redis's lexicographic tie-break).
-fn zset_row_before(s: &Store, e: u64, x: u64, y: u64) -> bool {
-    let sx: f64 = s.entries[e].zrows[x].score;
-    let sy: f64 = s.entries[e].zrows[y].score;
+fn zrows_before(rows: &Vec<ZRow>, x: u64, y: u64) -> bool {
+    let sx: f64 = rows[x].score;
+    let sy: f64 = rows[y].score;
     if sx != sy {
         return sx < sy;
     };
-    return bytes_lt(&s.entries[e].zrows[x].member, &s.entries[e].zrows[y].member);
+    return bytes_lt(&rows[x].member, &rows[y].member);
+}
+
+// Insertion-sort a scratch index over `rows` into ZRANGE order.
+fn zorder(rows: &Vec<ZRow>) -> Vec<u64> {
+    let order: Vec<u64> = Vec::new();
+    let n: u64 = len(rows);
+    let i0: u64 = 0;
+    while i0 < n {
+        order.push(i0);
+        i0 = i0 + 1;
+    }
+    let i: u64 = 1;
+    while i < n {
+        let key_row: u64 = order[i];
+        let j: u64 = i;
+        while j > 0 {
+            if zrows_before(rows, key_row, order[j - 1]) != true {
+                break;
+            };
+            order[j] = order[j - 1];
+            j = j - 1;
+        }
+        order[j] = key_row;
+        i = i + 1;
+    }
+    return order;
+}
+
+// Emit the [start, stop] slice of a sorted zset row set.
+fn zrange_reply(rows: &Vec<ZRow>, order: &Vec<u64>, start: i64, stop: i64, withscores: bool, out: Vec<u8>) -> Vec<u8> {
+    let (rok, a, b) = range_normalize(start, stop, len(rows) as i64);
+    if rok != true {
+        return resp_array_header(out, 0);
+    };
+    let total: i64 = b - a + 1;
+    if withscores {
+        out = resp_array_header(out, total * 2);
+    } else {
+        out = resp_array_header(out, total);
+    };
+    let k: i64 = a;
+    while k <= b {
+        let row: u64 = order[k as u64];
+        out = resp_bulk(out, &rows[row].member);
+        if withscores {
+            let text: Vec<u8> = fmt_f64(rows[row].score);
+            out = resp_bulk(out, &text);
+        };
+        k = k + 1;
+    }
+    return out;
+}
+
+// Materialize a packed zset's rows (member + parsed score) into
+// a scratch vector, in pack (insertion) order.
+fn pack_zrows(s: &Store, e: u64) -> Vec<ZRow> {
+    let rows: Vec<ZRow> = Vec::new();
+    let pk = &s.entries[e].pack;
+    let count: u64 = lp_count(pk);
+    let pos: u64 = 6;
+    let i: u64 = 0;
+    while i < count {
+        // member materialized only on the consuming path (see
+        // entry_decode_pack for the referee constraint)
+        let mpos: u64 = pos;
+        pos = lp_next(pk, pos);
+        let stext = lp_value_new(pk, pos);
+        pos = lp_next(pk, pos);
+        let (ok, sc) = parse_f64_full(&stext);
+        if ok {
+            let member = lp_value_new(pk, mpos);
+            rows.push(ZRow { member: member, score: sc });
+        };
+        i = i + 2;
+    }
+    return rows;
 }
 
 fn cmd_zadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
@@ -828,11 +1187,70 @@ fn cmd_zadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         };
         i = i + 2;
     }
-    let idx: i64 = lookup_or_create(s, &args[1], KIND_ZSET, now_ms);
+    let idx: i64 = lookup_or_create_agg(s, &args[1], KIND_ZSET, now_ms);
     if idx == -2 {
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        // Conversion pre-check: an oversized member, or the
+        // genuinely-new members passing the element cap. (Score
+        // elements are formatter output, always short.)
+        let convert: bool = false;
+        let j0: u64 = 2;
+        while j0 < len(args) {
+            if len(args[j0 + 1]) > PACK_MAX_ELEM_BYTES {
+                convert = true;
+            };
+            j0 = j0 + 2;
+        }
+        if convert != true {
+            let newm: u64 = 0;
+            let j: u64 = 2;
+            while j < len(args) {
+                if pack_pair_pos(&s.entries[e].pack, &args[j + 1]) < 0 {
+                    let seen: bool = false;
+                    let k: u64 = 2;
+                    while k < j {
+                        if bytes_eq(&args[k + 1], &args[j + 1]) {
+                            seen = true;
+                        };
+                        k = k + 2;
+                    }
+                    if seen != true {
+                        newm = newm + 1;
+                    };
+                };
+                j = j + 2;
+            }
+            if pack_logical_count(s, e) + newm > PACK_MAX_LOGICAL {
+                convert = true;
+            };
+        };
+        if convert {
+            entry_convert_plain(s, e);
+        } else {
+            let addedp: i64 = 0;
+            let p2: u64 = 2;
+            while p2 < len(args) {
+                let (okp, scp) = parse_f64_full(&args[p2]);
+                let text: Vec<u8> = fmt_f64(scp);
+                let mpos: i64 = pack_pair_pos(&s.entries[e].pack, &args[p2 + 1]);
+                if mpos >= 0 {
+                    let spos: u64 = lp_next(&s.entries[e].pack, mpos as u64);
+                    let pk = s.entries[e].pack;
+                    s.entries[e].pack = lp_replace(pk, spos, &text);
+                } else {
+                    let pk2 = s.entries[e].pack;
+                    let pk3 = lp_append(pk2, &args[p2 + 1]);
+                    s.entries[e].pack = lp_append(pk3, &text);
+                    addedp = addedp + 1;
+                };
+                p2 = p2 + 2;
+            }
+            return resp_int(out, addedp);
+        };
+    };
     let added: i64 = 0;
     let p: u64 = 2;
     while p < len(args) {
@@ -861,6 +1279,23 @@ fn cmd_zscore(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        let mpos: i64 = pack_pair_pos(&s.entries[e].pack, &args[2]);
+        if mpos < 0 {
+            return resp_nil(out);
+        };
+        let spos: u64 = lp_next(&s.entries[e].pack, mpos as u64);
+        let stext = lp_value_new(&s.entries[e].pack, spos);
+        let (ok, sc) = parse_f64_full(&stext);
+        if ok != true {
+            // Unreachable while the pack is written only by
+            // cmd_zadd (scores are stored as fmt_f64 output);
+            // reported loudly rather than papered over.
+            return resp_error(out, STR_PTR("ERR internal score representation is corrupt"), STR_LEN("ERR internal score representation is corrupt"));
+        };
+        let text: Vec<u8> = fmt_f64(sc);
+        return resp_bulk(out, &text);
+    };
     let mi: i64 = zset_member_index(s, e, &args[2]);
     if mi < 0 {
         return resp_nil(out);
@@ -897,49 +1332,13 @@ fn cmd_zrange(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
-    let n: u64 = len(s.entries[e].zrows);
-    // insertion-sort a scratch index into (score, member) order
-    let order: Vec<u64> = Vec::new();
-    let i0: u64 = 0;
-    while i0 < n {
-        order.push(i0);
-        i0 = i0 + 1;
-    }
-    let i: u64 = 1;
-    while i < n {
-        let key_row: u64 = order[i];
-        let j: u64 = i;
-        while j > 0 {
-            if zset_row_before(s, e, key_row, order[j - 1]) != true {
-                break;
-            };
-            order[j] = order[j - 1];
-            j = j - 1;
-        }
-        order[j] = key_row;
-        i = i + 1;
-    }
-    let (rok, a, b) = range_normalize(start, stop, n as i64);
-    if rok != true {
-        return resp_array_header(out, 0);
+    if s.entries[e].enc == ENC_PACKED {
+        let rows = pack_zrows(s, e);
+        let orderp = zorder(&rows);
+        return zrange_reply(&rows, &orderp, start, stop, withscores, out);
     };
-    let total: i64 = b - a + 1;
-    if withscores {
-        out = resp_array_header(out, total * 2);
-    } else {
-        out = resp_array_header(out, total);
-    };
-    let k: i64 = a;
-    while k <= b {
-        let row: u64 = order[k as u64];
-        out = resp_bulk(out, &s.entries[e].zrows[row].member);
-        if withscores {
-            let text: Vec<u8> = fmt_f64(s.entries[e].zrows[row].score);
-            out = resp_bulk(out, &text);
-        };
-        k = k + 1;
-    }
-    return out;
+    let order = zorder(&s.entries[e].zrows);
+    return zrange_reply(&s.entries[e].zrows, &order, start, stop, withscores, out);
 }
 
 fn cmd_zrem(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
@@ -954,6 +1353,25 @@ fn cmd_zrem(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        let removedp: i64 = 0;
+        let i2: u64 = 2;
+        while i2 < len(args) {
+            let mpos: i64 = pack_pair_pos(&s.entries[e].pack, &args[i2]);
+            if mpos >= 0 {
+                let spos: u64 = lp_next(&s.entries[e].pack, mpos as u64);
+                let pk = s.entries[e].pack;
+                let pk2 = lp_delete(pk, spos);
+                s.entries[e].pack = lp_delete(pk2, mpos as u64);
+                removedp = removedp + 1;
+            };
+            i2 = i2 + 1;
+        }
+        if lp_count(&s.entries[e].pack) == 0 {
+            entry_tombstone(s, e);
+        };
+        return resp_int(out, removedp);
+    };
     let removed: i64 = 0;
     let i: u64 = 2;
     while i < len(args) {
@@ -1014,6 +1432,12 @@ fn exec_command(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Ve
     };
     if bytes_eq_lit_ci(&args[0], STR_PTR("PERSIST"), STR_LEN("PERSIST")) {
         return cmd_persist(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("PEXPIREAT"), STR_LEN("PEXPIREAT")) {
+        return cmd_pexpireat(s, args, now_ms, out);
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("OBJECT"), STR_LEN("OBJECT")) {
+        return cmd_object(s, args, now_ms, out);
     };
     if bytes_eq_lit_ci(&args[0], STR_PTR("HSET"), STR_LEN("HSET")) {
         return cmd_hset(s, args, now_ms, out);

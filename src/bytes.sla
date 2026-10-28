@@ -155,12 +155,15 @@ fn parse_i64_full(a: &Vec<u8>) -> (bool, i64) {
 }
 
 // Append the decimal form of v to out. Value-threaded, see
-// bytes_push_lit.
+// bytes_push_lit. Digits are extracted from the (possibly
+// negative) value directly: negating i64::MIN overflows back to
+// itself, and the original form of this function printed a bare
+// "-" for it (caught by the M1 listpack stress round-trip, which
+// stores i64::MIN in the 64-bit integer encoding).
 fn append_i64(out: Vec<u8>, v: i64) -> Vec<u8> {
     let x: i64 = v;
     if x < 0 {
         out.push(45);
-        x = 0 - x;
     };
     let digs: [u8; 20] = [0u8; 20];
     let nd: u64 = 0;
@@ -168,8 +171,12 @@ fn append_i64(out: Vec<u8>, v: i64) -> Vec<u8> {
         out.push(48);
         return out;
     };
-    while x > 0 {
-        digs[nd] = (48 + (x % 10)) as u8;
+    while x != 0 {
+        let d: i64 = x % 10;
+        if d < 0 {
+            d = 0 - d;
+        };
+        digs[nd] = (48 + d) as u8;
         nd = nd + 1;
         x = x / 10;
     }

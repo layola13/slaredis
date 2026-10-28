@@ -1,11 +1,13 @@
 // store.sla -- the slaredis keyspace.
 //
-// Representation (M0, deliberately standard -- see README):
+// Representation:
 //   One Entry per key in a single Vec, found by linear scan with an
-//   FNV-1a pre-filter. All payloads live inline in the Entry as
-//   Vec<u8> byte strings / Vec pairs; there are no compact encodings
-//   (listpack/intset/skiplist) yet -- those are the documented M0
-//   simplification, not a hidden one.
+//   FNV-1a pre-filter. Payloads live inline in the Entry as Vec<u8>
+//   byte strings / Vec pairs. Since M1, small aggregates (hash /
+//   set / zset) start in the compact listpack representation
+//   (Entry.pack, listpack.sla) and convert one-way to the plain
+//   vectors past the thresholds declared below -- the same shape
+//   Redis uses, with intset/skiplist/rax still future work.
 //   Deletion and expiry tombstone the entry (kind = KIND_DEAD,
 //   payloads released); insert reuses dead slots, and the sweeper
 //   compacts when tombstones dominate.
@@ -18,6 +20,7 @@
 @import "sa_std/ptr.sa"
 @import "sa_std/core/slice.sa"
 @import "bytes.sla"
+@import "listpack.sla"
 
 const KIND_DEAD: u8 = 0;
 const KIND_STRING: u8 = 1;
@@ -25,6 +28,23 @@ const KIND_HASH: u8 = 2;
 const KIND_LIST: u8 = 3;
 const KIND_SET: u8 = 4;
 const KIND_ZSET: u8 = 5;
+
+// Value representations (M1). Aggregate kinds (hash / set / zset)
+// start PACKED: their elements live in one listpack byte string
+// (Entry.pack, see listpack.sla) and the payload vectors stay
+// empty. When a packed aggregate grows past the thresholds below
+// it converts one-way to PLAIN (the M0 vectors), exactly like
+// Redis's listpack -> hashtable/skiplist conversion. Strings and
+// lists are always PLAIN.
+const ENC_PLAIN: u8 = 0;
+const ENC_PACKED: u8 = 1;
+
+// Conversion thresholds (Redis defaults): a packed aggregate
+// converts when a write would push it past 128 logical elements
+// (hash fields / set members / zset members) or would insert an
+// element longer than 64 bytes.
+const PACK_MAX_LOGICAL: u64 = 128;
+const PACK_MAX_ELEM_BYTES: u64 = 64;
 
 // One sorted-set row. Scores live in a struct field because bare
 // Vec<f64> element reads return 0.0 with the current toolchain
@@ -40,6 +60,8 @@ struct Entry {
     key_hash: u64,
     kind: u8,
     expire_ms: i64,
+    enc: u8,
+    pack: Vec<u8>,
     sval: Vec<u8>,
     hfields: Vec<Vec<u8>>,
     hvalues: Vec<Vec<u8>>,
@@ -59,6 +81,8 @@ fn entry_blank(key: &Vec<u8>, key_hash: u64, kind: u8) -> Entry {
         key_hash: key_hash,
         kind: kind,
         expire_ms: 0,
+        enc: ENC_PLAIN,
+        pack: Vec::new(),
         sval: Vec::new(),
         hfields: Vec::new(),
         hvalues: Vec::new(),
@@ -80,6 +104,8 @@ fn entry_tombstone(s: &Store, i: u64) {
     };
     s.entries[i].kind = KIND_DEAD;
     s.entries[i].expire_ms = 0;
+    s.entries[i].enc = ENC_PLAIN;
+    s.entries[i].pack = Vec::new();
     s.entries[i].sval = Vec::new();
     s.entries[i].hfields = Vec::new();
     s.entries[i].hvalues = Vec::new();
@@ -95,6 +121,8 @@ fn entry_tombstone(s: &Store, i: u64) {
 fn entry_reset(s: &Store, i: u64, kind: u8) {
     s.entries[i].kind = kind;
     s.entries[i].expire_ms = 0;
+    s.entries[i].enc = ENC_PLAIN;
+    s.entries[i].pack = Vec::new();
     s.entries[i].sval = Vec::new();
     s.entries[i].hfields = Vec::new();
     s.entries[i].hvalues = Vec::new();
@@ -150,6 +178,151 @@ fn store_insert(s: &Store, key: &Vec<u8>, key_hash: u64, kind: u8) -> i64 {
     return (len(s.entries) - 1) as i64;
 }
 
+// Switch a fresh aggregate entry to the packed representation
+// (hash / set / zset creation path).
+fn entry_make_packed(s: &Store, i: u64) {
+    s.entries[i].enc = ENC_PACKED;
+    s.entries[i].pack = lp_new();
+}
+
+// Logical element count of a packed entry: fields for a hash,
+// members for a set, members (half the pack elements) for a zset.
+// Returns 0 for a plain entry.
+fn pack_logical_count(s: &Store, i: u64) -> u64 {
+    if s.entries[i].enc != ENC_PACKED {
+        return 0;
+    };
+    let n: u64 = lp_count(&s.entries[i].pack);
+    if s.entries[i].kind == KIND_SET {
+        return n;
+    };
+    return n / 2;
+}
+
+// Deep copy of an entry, PRESERVING its representation (a packed
+// entry clones its pack bytes; a plain entry clones its vectors).
+fn entry_clone(s: &Store, i: u64) -> Entry {
+    let e = entry_blank(&s.entries[i].key, s.entries[i].key_hash, s.entries[i].kind);
+    e.expire_ms = s.entries[i].expire_ms;
+    e.enc = s.entries[i].enc;
+    e.pack = bytes_clone(&s.entries[i].pack);
+    e.sval = bytes_clone(&s.entries[i].sval);
+    let k: u64 = 0;
+    while k < len(s.entries[i].hfields) {
+        e.hfields.push(bytes_clone(&s.entries[i].hfields[k]));
+        e.hvalues.push(bytes_clone(&s.entries[i].hvalues[k]));
+        k = k + 1;
+    }
+    let m: u64 = 0;
+    while m < len(s.entries[i].litems) {
+        e.litems.push(bytes_clone(&s.entries[i].litems[m]));
+        m = m + 1;
+    }
+    let q: u64 = 0;
+    while q < len(s.entries[i].smembers) {
+        e.smembers.push(bytes_clone(&s.entries[i].smembers[q]));
+        q = q + 1;
+    }
+    let z: u64 = 0;
+    while z < len(s.entries[i].zrows) {
+        e.zrows.push(ZRow { member: bytes_clone(&s.entries[i].zrows[z].member), score: s.entries[i].zrows[z].score });
+        z = z + 1;
+    }
+    return e;
+}
+
+// Decode the pack of entry i into the payload vectors of the
+// owned entry `e` (same kind). The pack is cloned first so the
+// loops read a local while filling `e`.
+fn entry_decode_pack(s: &Store, i: u64, e: Entry) -> Entry {
+    let pk = bytes_clone(&s.entries[i].pack);
+    let count: u64 = lp_count(&pk);
+    if s.entries[i].kind == KIND_SET {
+        let pos: u64 = 6;
+        let n: u64 = 0;
+        while n < count {
+            e.smembers.push(lp_value_new(&pk, pos));
+            pos = lp_next(&pk, pos);
+            n = n + 1;
+        }
+        return e;
+    };
+    // hash and zset store flat (name, payload) element pairs.
+    // The two kinds get separate loops (the kind is fixed for the
+    // whole entry): mixing them in one loop body makes the payload
+    // register consumed on the hash path and merely borrowed on
+    // the zset path, which the referee rejects at the loop merge.
+    if s.entries[i].kind == KIND_HASH {
+        let pos2: u64 = 6;
+        let n2: u64 = 0;
+        while n2 < count {
+            let name = lp_value_new(&pk, pos2);
+            pos2 = lp_next(&pk, pos2);
+            let payload = lp_value_new(&pk, pos2);
+            pos2 = lp_next(&pk, pos2);
+            e.hfields.push(name);
+            e.hvalues.push(payload);
+            n2 = n2 + 2;
+        }
+        return e;
+    };
+    let pos3: u64 = 6;
+    let n3: u64 = 0;
+    while n3 < count {
+        // The member bytes are materialized only on the path that
+        // consumes them: a loop-local value moved inside a nested
+        // branch makes the compiler emit its release at a merge
+        // where the register is out of scope (UnknownRegister in
+        // the SA referee), so the conditional shape is avoided
+        // entirely here.
+        let name_pos: u64 = pos3;
+        pos3 = lp_next(&pk, pos3);
+        let payload = lp_value_new(&pk, pos3);
+        pos3 = lp_next(&pk, pos3);
+        // zset payload is the score text written by fmt_f64;
+        // parse_f64_full accepts every form fmt_f64 emits (plain
+        // decimal, exponent, inf) -- an invariant the round-trip
+        // tests exercise, including extreme scores.
+        let (ok, sc) = parse_f64_full(&payload);
+        if ok {
+            let name = lp_value_new(&pk, name_pos);
+            e.zrows.push(ZRow { member: name, score: sc });
+        };
+        n3 = n3 + 2;
+    }
+    return e;
+}
+
+// A decoded, plain-representation deep copy of entry i: packed
+// entries are materialized into payload vectors, plain entries
+// are cloned. The source entry is untouched. The AOF dataset
+// serializer works only with materialized entries.
+fn entry_materialized(s: &Store, i: u64) -> Entry {
+    let e = entry_blank(&s.entries[i].key, s.entries[i].key_hash, s.entries[i].kind);
+    e.expire_ms = s.entries[i].expire_ms;
+    if s.entries[i].enc == ENC_PACKED {
+        let e2 = entry_decode_pack(s, i, e);
+        return e2;
+    };
+    let c = entry_clone(s, i);
+    return c;
+}
+
+// One-way conversion of a packed entry to the plain (M0 vector)
+// representation, in place, payload-preserving.
+fn entry_convert_plain(s: &Store, i: u64) {
+    if s.entries[i].enc != ENC_PACKED {
+        return;
+    };
+    let m = entry_materialized(s, i);
+    s.entries[i].hfields = m.hfields;
+    s.entries[i].hvalues = m.hvalues;
+    s.entries[i].smembers = m.smembers;
+    s.entries[i].zrows = m.zrows;
+    s.entries[i].enc = ENC_PLAIN;
+    s.entries[i].pack = Vec::new();
+}
+
 // Active expiry sweep + tombstone compaction. Called periodically
 // from the server loop. Returns how many keys the sweep expired.
 fn store_sweep(s: &Store, now_ms: i64) -> u64 {
@@ -172,31 +345,7 @@ fn store_sweep(s: &Store, now_ms: i64) -> u64 {
             let j: u64 = 0;
             while j < len(s.entries) {
                 if s.entries[j].kind != KIND_DEAD {
-                    let e = entry_blank(&s.entries[j].key, s.entries[j].key_hash, s.entries[j].kind);
-                    e.expire_ms = s.entries[j].expire_ms;
-                    e.sval = bytes_clone(&s.entries[j].sval);
-                    let k: u64 = 0;
-                    while k < len(s.entries[j].hfields) {
-                        e.hfields.push(bytes_clone(&s.entries[j].hfields[k]));
-                        e.hvalues.push(bytes_clone(&s.entries[j].hvalues[k]));
-                        k = k + 1;
-                    }
-                    let m: u64 = 0;
-                    while m < len(s.entries[j].litems) {
-                        e.litems.push(bytes_clone(&s.entries[j].litems[m]));
-                        m = m + 1;
-                    }
-                    let q: u64 = 0;
-                    while q < len(s.entries[j].smembers) {
-                        e.smembers.push(bytes_clone(&s.entries[j].smembers[q]));
-                        q = q + 1;
-                    }
-                    let z: u64 = 0;
-                    while z < len(s.entries[j].zrows) {
-                        e.zrows.push(ZRow { member: bytes_clone(&s.entries[j].zrows[z].member), score: s.entries[j].zrows[z].score });
-                        z = z + 1;
-                    }
-                    fresh.push(e);
+                    fresh.push(entry_clone(s, j));
                 };
                 j = j + 1;
             }
