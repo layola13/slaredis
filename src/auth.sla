@@ -1,0 +1,99 @@
+// auth.sla -- AUTH command execution and the per-connection
+// authentication gate.
+//
+// Model (Redis): when a password is configured, a fresh
+// connection may run AUTH and nothing else; every other command
+// gets `-NOAUTH Authentication required.` (produced by the gate
+// in server.sla). AUTH itself is executed here, with Redis's
+// exact error forms: WRONGPASS for a bad password or a non-default
+// username, and the "called without any password configured" text
+// when AUTH is used on a server with no password set.
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+@import "resp.sla"
+
+struct AuthConfig {
+    required: bool,
+    password: Vec<u8>,
+}
+
+fn auth_is_auth_command(args: &Vec<Vec<u8>>) -> bool {
+    if len(args) == 0 {
+        return false;
+    };
+    return bytes_eq_lit_ci(&args[0], STR_PTR("AUTH"), STR_LEN("AUTH"));
+}
+
+// The gate: everything is allowed when no password is configured
+// or the connection is authenticated; an unauthenticated
+// connection may only attempt AUTH.
+fn auth_gate_allows(cfg: &AuthConfig, authed: bool, args: &Vec<Vec<u8>>) -> bool {
+    if cfg.required != true {
+        return true;
+    };
+    if authed {
+        return true;
+    };
+    return auth_is_auth_command(args);
+}
+
+fn auth_err_arity(out: Vec<u8>) -> Vec<u8> {
+    out.push(45);
+    out = bytes_push_lit(out, STR_PTR("ERR wrong number of arguments for 'auth' command"), STR_LEN("ERR wrong number of arguments for 'auth' command"));
+    out.push(13);
+    out.push(10);
+    return out;
+}
+
+fn auth_err_wrongpass(out: Vec<u8>) -> Vec<u8> {
+    return resp_error(out, STR_PTR("WRONGPASS invalid username-password pair or user is disabled."), STR_LEN("WRONGPASS invalid username-password pair or user is disabled."));
+}
+
+// Exact byte compare against the literal "default" (Redis
+// usernames are case-sensitive, unlike command names).
+fn auth_is_default_user(a: &Vec<u8>) -> bool {
+    if len(a) != 7 {
+        return false;
+    };
+    let want: [u8; 7] = [100u8, 101u8, 102u8, 97u8, 117u8, 108u8, 116u8];
+    let i: u64 = 0;
+    while i < 7 {
+        if a[i] != want[i] {
+            return false;
+        };
+        i = i + 1;
+    }
+    return true;
+}
+
+// Execute AUTH. Returns (out, authenticated): the second element
+// is true only on a successful authentication.
+fn cmd_auth(cfg: &AuthConfig, args: &Vec<Vec<u8>>, out: Vec<u8>) -> (Vec<u8>, bool) {
+    if len(args) < 2 || len(args) > 3 {
+        let o = auth_err_arity(out);
+        return (o, false);
+    };
+    if cfg.required != true {
+        if len(args) == 2 {
+            let o2 = resp_error(out, STR_PTR("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"), STR_LEN("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"));
+            return (o2, false);
+        };
+        let o3 = resp_error(out, STR_PTR("ERR AUTH <username> <password> called without any password configured for the default user. Are you sure your configuration is correct?"), STR_LEN("ERR AUTH <username> <password> called without any password configured for the default user. Are you sure your configuration is correct?"));
+        return (o3, false);
+    };
+    if len(args) == 3 {
+        if auth_is_default_user(&args[1]) != true {
+            let o4 = auth_err_wrongpass(out);
+            return (o4, false);
+        };
+    };
+    if bytes_eq(&args[len(args) - 1], &cfg.password) {
+        let o5 = resp_simple(out, STR_PTR("OK"), STR_LEN("OK"));
+        return (o5, true);
+    };
+    let o6 = auth_err_wrongpass(out);
+    return (o6, false);
+}

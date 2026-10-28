@@ -29,6 +29,9 @@
 @import "store.sla"
 @import "resp.sla"
 @import "commands.sla"
+@import "auth.sla"
+@import "journal.sla"
+@import "aof.sla"
 
 struct Conn {
     stream: u64,
@@ -39,9 +42,10 @@ struct Conn {
     open: bool,
     eof: bool,
     close_after_flush: bool,
+    authed: bool,
 }
 
-fn conn_new(stream: u64) -> Conn {
+fn conn_new(stream: u64, authed: bool) -> Conn {
     return Conn {
         stream: stream,
         inbuf: Vec::new(),
@@ -51,6 +55,7 @@ fn conn_new(stream: u64) -> Conn {
         open: true,
         eof: false,
         close_after_flush: false,
+        authed: authed,
     };
 }
 
@@ -80,7 +85,15 @@ fn conn_read(conns: &Vec<Conn>, i: u64) -> bool {
 
 // Execute every complete command buffered on conns[i], appending
 // replies to its out buffer. Returns true when a command ran.
-fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64) -> bool {
+//
+// Per command, in order: the AUTH gate (an unauthenticated
+// connection may only attempt AUTH; everything else is answered
+// NOAUTH without executing), AUTH itself, BGREWRITEAOF (handled
+// here because it needs the AOF state, not just the store), the
+// broken-AOF write refusal, and finally normal dispatch followed
+// by the journal hook (successful write commands are appended to
+// the AOF before their replies are flushed).
+fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64, auth: &AuthConfig, aof: &AofState) -> bool {
     let ran: bool = false;
     while conns[i].inoff < len(conns[i].inbuf) {
         let pr = resp_parse(&conns[i].inbuf, conns[i].inoff);
@@ -98,9 +111,59 @@ fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64) -> bool {
         if pr.state == PARSE_OK {
             // value-threaded reply buffer: move the field out, run
             // the command, assign the buffer back (probe S6 shape)
-            let ob = conns[i].outbuf;
-            conns[i].outbuf = exec_command(s, &pr.args, now_ms, ob);
-            ran = true;
+            if auth_gate_allows(auth, conns[i].authed, &pr.args) != true {
+                let ob = conns[i].outbuf;
+                conns[i].outbuf = resp_error(ob, STR_PTR("NOAUTH Authentication required."), STR_LEN("NOAUTH Authentication required."));
+                ran = true;
+            } else {
+                if auth_is_auth_command(&pr.args) {
+                    let ob2 = conns[i].outbuf;
+                    let (ob3, ok) = cmd_auth(auth, &pr.args, ob2);
+                    conns[i].outbuf = ob3;
+                    if ok {
+                        conns[i].authed = true;
+                    };
+                    ran = true;
+                } else {
+                    if aof_is_rewrite_command(&pr.args) {
+                        let ob4 = conns[i].outbuf;
+                        if len(pr.args) != 1 {
+                            conns[i].outbuf = err_arity(ob4, STR_PTR("bgrewriteaof"), STR_LEN("bgrewriteaof"));
+                        } else {
+                            if aof.enabled != true {
+                                conns[i].outbuf = resp_error(ob4, STR_PTR("ERR BGREWRITEAOF requires AOF persistence to be enabled"), STR_LEN("ERR BGREWRITEAOF requires AOF persistence to be enabled"));
+                            } else {
+                                if aof_rewrite(aof, s, now_ms) {
+                                    conns[i].outbuf = resp_simple(ob4, STR_PTR("AOF rewrite completed"), STR_LEN("AOF rewrite completed"));
+                                } else {
+                                    conns[i].outbuf = resp_error(ob4, STR_PTR("ERR AOF rewrite failed"), STR_LEN("ERR AOF rewrite failed"));
+                                };
+                            };
+                        };
+                        ran = true;
+                    } else {
+                        if aof.enabled && aof.broken && journal_is_write(&pr.args) {
+                            let ob5 = conns[i].outbuf;
+                            conns[i].outbuf = resp_error(ob5, STR_PTR("ERR AOF write failed: persistence is broken, writes are refused"), STR_LEN("ERR AOF write failed: persistence is broken, writes are refused"));
+                            ran = true;
+                        } else {
+                            let ob6 = conns[i].outbuf;
+                            let before: u64 = len(ob6);
+                            let ob7 = exec_command(s, &pr.args, now_ms, ob6);
+                            conns[i].outbuf = ob7;
+                            ran = true;
+                            if aof.enabled && journal_is_write(&pr.args) {
+                                if len(conns[i].outbuf) > before {
+                                    if conns[i].outbuf[before] != 45 {
+                                        let rec = journal_record(&pr.args, now_ms);
+                                        let okj = aof_append(aof, &rec, now_ms);
+                                    };
+                                };
+                            };
+                        };
+                    };
+                };
+            };
         };
     }
     // compact the input buffer: drop the consumed prefix
@@ -161,10 +224,24 @@ fn conn_drained(conns: &Vec<Conn>, i: u64) -> bool {
 }
 
 // Run forever; returns only on setup failure (exit-code contract
-// documented in README.md).
-fn run_server(s: &Store, host: Vec<u8>, port: u32) -> i32 {
+// documented in README.md). With AOF enabled, startup replays the
+// file into the store and opens the append handle before the
+// listener exists; any failure there exits 69 rather than serving
+// a silently partial dataset.
+fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: AofConfig) -> i32 {
     if len(host) > 63 {
         return 65;
+    };
+    let aof = aof_state_new(&aof_cfg);
+    if aof.enabled {
+        let rc: i32 = aof_replay(&aof_cfg, s, sa_time_unix_ms());
+        if rc != 0 {
+            return 69;
+        };
+        if aof_open(&aof) != true {
+            return 69;
+        };
+        aof.last_sync_ms = sa_time_unix_ms();
     };
     let harr: [u8; 64] = [0u8; 64];
     let hi: u64 = 0;
@@ -199,7 +276,7 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32) -> i32 {
                 break;
             };
             let nb: i32 = sa_std_net_tcp_stream_set_nonblocking(h, 1);
-            conns.push(conn_new(h));
+            conns.push(conn_new(h, auth.required != true));
             progress = true;
             accepts = accepts + 1;
         }
@@ -210,7 +287,7 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32) -> i32 {
                 if conn_read(&conns, ci) {
                     progress = true;
                 };
-                if conn_exec_all(s, &conns, ci, now_ms) {
+                if conn_exec_all(s, &conns, ci, now_ms, &auth, &aof) {
                     progress = true;
                 };
                 if conn_flush(&conns, ci) {
@@ -249,6 +326,7 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32) -> i32 {
                             open: true,
                             eof: conns[m].eof,
                             close_after_flush: conns[m].close_after_flush,
+                            authed: conns[m].authed,
                         });
                     };
                     m = m + 1;
@@ -260,6 +338,7 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32) -> i32 {
             let swept: u64 = store_sweep(s, now_ms);
             last_sweep = now_ms;
         };
+        aof_tick(&aof, s, now_ms);
         if progress != true {
             THREAD_SLEEP_MS(1);
         };
