@@ -222,3 +222,16 @@ fn resp_array_header(out: Vec<u8>, n: i64) -> Vec<u8> {
     out.push(10);
     return out;
 }
+
+// Serialize a whole command as a RESP multibulk array -- the
+// on-disk form of an AOF record (an AOF file is just a stream of
+// these). Used by the journal hook and the dataset serializer.
+fn resp_write_command(out: Vec<u8>, args: &Vec<Vec<u8>>) -> Vec<u8> {
+    out = resp_array_header(out, len(args) as i64);
+    let i: u64 = 0;
+    while i < len(args) {
+        out = resp_bulk(out, &args[i]);
+        i = i + 1;
+    }
+    return out;
+}

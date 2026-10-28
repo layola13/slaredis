@@ -1,0 +1,142 @@
+// journal.sla -- the AOF journal hook: which executed commands
+// get journaled, and the exact bytes of each AOF record.
+//
+// A record is the command itself in RESP multibulk form, with one
+// determinism rewrite borrowed from Redis: relative expiries are
+// journaled as absolute deadlines. A SET with EX/PX becomes a
+// plain SET plus a PEXPIREAT record; an EXPIRE becomes a
+// PEXPIREAT record. Replaying the file at any later time then
+// reproduces the original deadlines instead of re-extending them.
+// Every other write command is deterministic as written and is
+// journaled verbatim.
+//
+// The server calls journal_record only for commands whose reply
+// was not an error (an errored command changed nothing), which is
+// the hook's contract; the classification here is name-based.
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+@import "resp.sla"
+
+fn journal_is_write(args: &Vec<Vec<u8>>) -> bool {
+    if len(args) == 0 {
+        return false;
+    };
+    let n = &args[0];
+    if bytes_eq_lit_ci(n, STR_PTR("SET"), STR_LEN("SET")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("DEL"), STR_LEN("DEL")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("INCR"), STR_LEN("INCR")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("DECR"), STR_LEN("DECR")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("EXPIRE"), STR_LEN("EXPIRE")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("PEXPIREAT"), STR_LEN("PEXPIREAT")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("PERSIST"), STR_LEN("PERSIST")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("HSET"), STR_LEN("HSET")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("HDEL"), STR_LEN("HDEL")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("LPUSH"), STR_LEN("LPUSH")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("RPUSH"), STR_LEN("RPUSH")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("LPOP"), STR_LEN("LPOP")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("RPOP"), STR_LEN("RPOP")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("SADD"), STR_LEN("SADD")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("SREM"), STR_LEN("SREM")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("ZADD"), STR_LEN("ZADD")) { return true; };
+    if bytes_eq_lit_ci(n, STR_PTR("ZREM"), STR_LEN("ZREM")) { return true; };
+    return false;
+}
+
+// Saturating now + delta, identical rule to commands.sla's
+// expire_deadline.
+fn journal_deadline(now_ms: i64, delta_ms: i64) -> i64 {
+    if delta_ms > 0 {
+        if now_ms > 9223372036854775807 - delta_ms {
+            return 9223372036854775807;
+        };
+    };
+    return now_ms + delta_ms;
+}
+
+// Append a synthesized `PEXPIREAT key deadline` record to out.
+fn journal_push_pexpireat(out: Vec<u8>, key: &Vec<u8>, deadline: i64) -> Vec<u8> {
+    let t: Vec<Vec<u8>> = Vec::new();
+    let c0: Vec<u8> = Vec::new();
+    t.push(bytes_push_lit(c0, STR_PTR("PEXPIREAT"), STR_LEN("PEXPIREAT")));
+    t.push(bytes_clone(key));
+    let c2: Vec<u8> = Vec::new();
+    t.push(append_i64(c2, deadline));
+    return resp_write_command(out, &t);
+}
+
+// Serialize args[lo..hi] as one record (no cloning of elements).
+fn journal_push_range(out: Vec<u8>, args: &Vec<Vec<u8>>, lo: u64, hi: u64) -> Vec<u8> {
+    out = resp_array_header(out, (hi - lo) as i64);
+    let i: u64 = lo;
+    while i < hi {
+        out = resp_bulk(out, &args[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// The AOF record bytes for one executed write command.
+fn journal_record(args: &Vec<Vec<u8>>, now_ms: i64) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    if bytes_eq_lit_ci(&args[0], STR_PTR("SET"), STR_LEN("SET")) {
+        // Find an EX/PX option pair (the M0 SET grammar has only
+        // those options, each with one value).
+        let deadline: i64 = 0;
+        let has_deadline: bool = false;
+        let i: u64 = 3;
+        while i + 1 < len(args) + 1 {
+            if i + 1 >= len(args) {
+                break;
+            };
+            if bytes_eq_lit_ci(&args[i], STR_PTR("EX"), STR_LEN("EX")) {
+                let (ok, sec) = parse_i64_full(&args[i + 1]);
+                if ok {
+                    if sec > 9223372036854775807 / 1000 {
+                        deadline = 9223372036854775807;
+                    } else {
+                        deadline = journal_deadline(now_ms, sec * 1000);
+                    };
+                    has_deadline = true;
+                };
+            };
+            if bytes_eq_lit_ci(&args[i], STR_PTR("PX"), STR_LEN("PX")) {
+                let (ok2, ms) = parse_i64_full(&args[i + 1]);
+                if ok2 {
+                    deadline = journal_deadline(now_ms, ms);
+                    has_deadline = true;
+                };
+            };
+            i = i + 2;
+        }
+        if has_deadline {
+            // SET without the option (a plain SET also clears any
+            // old TTL on replay, matching live semantics), then
+            // the absolute deadline.
+            let o2 = journal_push_range(out, args, 0, 3);
+            return journal_push_pexpireat(o2, &args[1], deadline);
+        };
+        return journal_push_range(out, args, 0, len(args));
+    };
+    if bytes_eq_lit_ci(&args[0], STR_PTR("EXPIRE"), STR_LEN("EXPIRE")) {
+        if len(args) == 3 {
+            let (ok3, sec3) = parse_i64_full(&args[2]);
+            if ok3 {
+                let dl: i64 = 0;
+                if sec3 > 9223372036854775807 / 1000 {
+                    dl = 9223372036854775807;
+                } else {
+                    dl = journal_deadline(now_ms, sec3 * 1000);
+                };
+                return journal_push_pexpireat(out, &args[1], dl);
+            };
+        };
+        // An EXPIRE that executed successfully always parses; if
+        // it somehow did not, journal nothing rather than a
+        // record replay would misread.
+        return out;
+    };
+    return journal_push_range(out, args, 0, len(args));
+}

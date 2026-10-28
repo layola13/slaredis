@@ -1,0 +1,486 @@
+// aof.sla -- append-only file persistence (model A, ruled
+// 2026-10-28; see docs/PERSISTENCE.md for the decision record).
+//
+// Contents: the AOF file state and append path with the fsync
+// policy, startup replay, the full-dataset serializer, the
+// rewrite (compaction) path, and the reserved snapshot interface
+// (model B -- declared, deliberately not implemented).
+//
+// The journal hook (journal.sla) renders each executed write
+// command as a RESP record; this module appends those records to
+// the file. Replay is the mirror: parse the file as a RESP stream
+// and execute every command against the store before the server
+// starts accepting connections.
+//
+// Paths are capped at 255 bytes by config validation (main.sla),
+// so every fs call site stages the path in a fixed stack array --
+// the same idiom server.sla uses for the listen host.
+@import "sa_std/fs.sai"
+@import "sa_std/status.sla"
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+@import "store.sla"
+@import "resp.sla"
+@import "journal.sla"
+@import "commands.sla"
+
+const AOF_FSYNC_ALWAYS: u8 = 0;
+const AOF_FSYNC_EVERYSEC: u8 = 1;
+const AOF_FSYNC_NO: u8 = 2;
+
+// Auto-rewrite trigger: the file must have grown by at least
+// this many bytes since the last rewrite AND at least doubled
+// (Redis's percentage rule with a small-system minimum size).
+const AOF_REWRITE_MIN_GROWTH: u64 = 1048576;
+
+// Model B (snapshot) is not implemented; see the reservation at
+// the bottom of this file.
+const SNAPSHOT_NOT_IMPLEMENTED: i32 = -1;
+
+struct AofConfig {
+    enabled: bool,
+    path: Vec<u8>,
+    fsync_mode: u8,
+}
+
+struct AofState {
+    enabled: bool,
+    path: Vec<u8>,
+    fsync_mode: u8,
+    file: u64,
+    size: u64,
+    base_size: u64,
+    last_sync_ms: i64,
+    unsynced: u64,
+    broken: bool,
+}
+
+fn aof_state_new(cfg: &AofConfig) -> AofState {
+    return AofState {
+        enabled: cfg.enabled,
+        path: bytes_clone(&cfg.path),
+        fsync_mode: cfg.fsync_mode,
+        file: 0,
+        size: 0,
+        base_size: 0,
+        last_sync_ms: 0,
+        unsynced: 0,
+        broken: false,
+    };
+}
+
+fn aof_is_rewrite_command(args: &Vec<Vec<u8>>) -> bool {
+    if len(args) == 0 {
+        return false;
+    };
+    return bytes_eq_lit_ci(&args[0], STR_PTR("BGREWRITEAOF"), STR_LEN("BGREWRITEAOF"));
+}
+
+// Open `path` for appending (create if missing): write | create |
+// append = flags 2 | 4 | 16.
+fn aof_open_append(path: &Vec<u8>) -> (bool, u64) {
+    let arr: [u8; 256] = [0u8; 256];
+    let i: u64 = 0;
+    while i < len(path) {
+        arr[i] = path[i];
+        i = i + 1;
+    }
+    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    let h: u64 = 0;
+    let st: i32 = sa_std_fs_open_options(ap, len(path), 22, 438, 0, &h);
+    if st != SA_STD_OK {
+        return (false, 0);
+    };
+    return (true, h);
+}
+
+// Write all of `data` to an open file handle, in 4 KiB staged
+// chunks (partial writes advance and retry).
+fn aof_write_all(file: u64, data: &Vec<u8>) -> bool {
+    let off: u64 = 0;
+    while off < len(data) {
+        let chunk: u64 = len(data) - off;
+        if chunk > 4096 {
+            chunk = 4096;
+        };
+        let arr: [u8; 4096] = [0u8; 4096];
+        let j: u64 = 0;
+        while j < chunk {
+            arr[j] = data[off + j];
+            j = j + 1;
+        }
+        let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+        let written: u64 = 0;
+        let st: i32 = sa_std_fs_file_write(file, ap, chunk, &written);
+        if st != SA_STD_OK {
+            return false;
+        };
+        if written == 0 {
+            return false;
+        };
+        off = off + written;
+    }
+    return true;
+}
+
+fn aof_remove_file(path: &Vec<u8>) -> i32 {
+    let arr: [u8; 256] = [0u8; 256];
+    let i: u64 = 0;
+    while i < len(path) {
+        arr[i] = path[i];
+        i = i + 1;
+    }
+    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    return sa_std_fs_remove(ap, len(path));
+}
+
+// Startup step 1: open the append handle and adopt the current
+// file size as the rewrite baseline.
+fn aof_open(st: &AofState) -> bool {
+    let (ok, h) = aof_open_append(&st.path);
+    if ok != true {
+        return false;
+    };
+    st.file = h;
+    let arr: [u8; 256] = [0u8; 256];
+    let i: u64 = 0;
+    while i < len(st.path) {
+        arr[i] = st.path[i];
+        i = i + 1;
+    }
+    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    let n: u64 = 0;
+    let lst: i32 = sa_std_fs_len(ap, len(st.path), &n);
+    if lst == SA_STD_OK {
+        st.size = n;
+        st.base_size = n;
+    };
+    return true;
+}
+
+// Append one journal record. Honors the fsync policy for the
+// "always" mode; "everysec" is driven by aof_tick; "no" never
+// syncs. Any IO failure marks the state broken: the caller-visible
+// consequence is that the server refuses further writes with an
+// explicit error (see server.sla) instead of silently continuing
+// unpersisted.
+fn aof_append(st: &AofState, rec: &Vec<u8>, now_ms: i64) -> bool {
+    if st.enabled != true {
+        return true;
+    };
+    if st.broken {
+        return false;
+    };
+    if aof_write_all(st.file, rec) != true {
+        st.broken = true;
+        return false;
+    };
+    st.size = st.size + len(rec);
+    st.unsynced = st.unsynced + len(rec);
+    if st.fsync_mode == AOF_FSYNC_ALWAYS {
+        let sst: i32 = sa_fs_file_sync_data(st.file);
+        if sst != SA_STD_OK {
+            st.broken = true;
+            return false;
+        };
+        st.unsynced = 0;
+        st.last_sync_ms = now_ms;
+    };
+    return true;
+}
+
+// Periodic loop tick (called next to the expiry sweep): the
+// everysec fsync, and the automatic rewrite check.
+fn aof_tick(st: &AofState, s: &Store, now_ms: i64) {
+    if st.enabled != true {
+        return;
+    };
+    if st.broken {
+        return;
+    };
+    if st.fsync_mode == AOF_FSYNC_EVERYSEC {
+        if st.unsynced > 0 {
+            if now_ms - st.last_sync_ms >= 1000 {
+                let sst: i32 = sa_fs_file_sync_data(st.file);
+                if sst == SA_STD_OK {
+                    st.unsynced = 0;
+                    st.last_sync_ms = now_ms;
+                } else {
+                    st.broken = true;
+                    return;
+                };
+            };
+        };
+    };
+    if st.size >= st.base_size + AOF_REWRITE_MIN_GROWTH {
+        if st.size >= st.base_size * 2 {
+            // A failed auto-rewrite is not fatal and not silent:
+            // the old AOF stays authoritative and the check simply
+            // fires again on a later tick (the same posture Redis
+            // takes). Manual BGREWRITEAOF reports failures to the
+            // requesting client directly.
+            let ok = aof_rewrite(st, s, now_ms);
+        };
+    };
+}
+
+// ---- dataset serializer ----
+// Renders the whole live dataset as AOF records (the rewrite
+// payload, and the round-trip vehicle for the persistence
+// tests): replaying this output into an empty store reproduces
+// the dataset, expiries included (as absolute PEXPIREATs).
+
+fn dataset_serialize_entry(m: &Entry, out: Vec<u8>) -> Vec<u8> {
+    let t: Vec<Vec<u8>> = Vec::new();
+    if m.kind == KIND_STRING {
+        let c: Vec<u8> = Vec::new();
+        t.push(bytes_push_lit(c, STR_PTR("SET"), STR_LEN("SET")));
+        t.push(bytes_clone(&m.key));
+        t.push(bytes_clone(&m.sval));
+    } else {
+        if m.kind == KIND_HASH {
+            if len(m.hfields) == 0 {
+                return out;
+            };
+            let c2: Vec<u8> = Vec::new();
+            t.push(bytes_push_lit(c2, STR_PTR("HSET"), STR_LEN("HSET")));
+            t.push(bytes_clone(&m.key));
+            let i: u64 = 0;
+            while i < len(m.hfields) {
+                t.push(bytes_clone(&m.hfields[i]));
+                t.push(bytes_clone(&m.hvalues[i]));
+                i = i + 1;
+            }
+        } else {
+            if m.kind == KIND_LIST {
+                if len(m.litems) == 0 {
+                    return out;
+                };
+                let c3: Vec<u8> = Vec::new();
+                t.push(bytes_push_lit(c3, STR_PTR("RPUSH"), STR_LEN("RPUSH")));
+                t.push(bytes_clone(&m.key));
+                let i2: u64 = 0;
+                while i2 < len(m.litems) {
+                    t.push(bytes_clone(&m.litems[i2]));
+                    i2 = i2 + 1;
+                }
+            } else {
+                if m.kind == KIND_SET {
+                    if len(m.smembers) == 0 {
+                        return out;
+                    };
+                    let c4: Vec<u8> = Vec::new();
+                    t.push(bytes_push_lit(c4, STR_PTR("SADD"), STR_LEN("SADD")));
+                    t.push(bytes_clone(&m.key));
+                    let i3: u64 = 0;
+                    while i3 < len(m.smembers) {
+                        t.push(bytes_clone(&m.smembers[i3]));
+                        i3 = i3 + 1;
+                    }
+                } else {
+                    if m.kind == KIND_ZSET {
+                        if len(m.zrows) == 0 {
+                            return out;
+                        };
+                        let c5: Vec<u8> = Vec::new();
+                        t.push(bytes_push_lit(c5, STR_PTR("ZADD"), STR_LEN("ZADD")));
+                        t.push(bytes_clone(&m.key));
+                        let i4: u64 = 0;
+                        while i4 < len(m.zrows) {
+                            t.push(fmt_f64(m.zrows[i4].score));
+                            t.push(bytes_clone(&m.zrows[i4].member));
+                            i4 = i4 + 1;
+                        }
+                    } else {
+                        return out;
+                    };
+                };
+            };
+        };
+    };
+    let out2 = resp_write_command(out, &t);
+    if m.expire_ms != 0 {
+        return journal_push_pexpireat(out2, &m.key, m.expire_ms);
+    };
+    return out2;
+}
+
+fn dataset_serialize(s: &Store, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
+    let i: u64 = 0;
+    while i < len(s.entries) {
+        if s.entries[i].kind != KIND_DEAD {
+            if entry_expired(s, i, now_ms) != true {
+                let m = entry_materialized(s, i);
+                out = dataset_serialize_entry(&m, out);
+            };
+        };
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- rewrite (compaction) ----
+// Serialize the dataset to <path>.rewrite.tmp, fsync it, then
+// atomically rename it over the live AOF and reopen the append
+// handle. Synchronous in this single-threaded server (a
+// documented deviation from Redis's forked BGREWRITEAOF; see
+// docs/PERSISTENCE.md). Returns false on failure with the old
+// AOF left authoritative whenever that is still possible.
+fn aof_rewrite(st: &AofState, s: &Store, now_ms: i64) -> bool {
+    if st.enabled != true {
+        return false;
+    };
+    let data = dataset_serialize(s, now_ms, Vec::new());
+    let tmp = bytes_clone(&st.path);
+    let tmp2 = bytes_push_lit(tmp, STR_PTR(".rewrite.tmp"), STR_LEN(".rewrite.tmp"));
+    // write + sync the temp file
+    let tarr: [u8; 256] = [0u8; 256];
+    let ti: u64 = 0;
+    while ti < len(tmp2) {
+        tarr[ti] = tmp2[ti];
+        ti = ti + 1;
+    }
+    let tp: ptr = PTR_BYTE_ADD(&tarr, 0);
+    let h: u64 = 0;
+    let ost: i32 = sa_std_fs_open_write(tp, len(tmp2), 1, &h);
+    if ost != SA_STD_OK {
+        return false;
+    };
+    if aof_write_all(h, &data) != true {
+        let cc = sa_fs_file_close(h);
+        let rr = aof_remove_file(&tmp2);
+        return false;
+    };
+    let sst: i32 = sa_fs_file_sync_data(h);
+    let cc2 = sa_fs_file_close(h);
+    if sst != SA_STD_OK {
+        let rr2 = aof_remove_file(&tmp2);
+        return false;
+    };
+    // swap: close the live handle, rename over it, reopen
+    let cc3 = sa_fs_file_close(st.file);
+    let parr: [u8; 256] = [0u8; 256];
+    let pi: u64 = 0;
+    while pi < len(st.path) {
+        parr[pi] = st.path[pi];
+        pi = pi + 1;
+    }
+    let pp: ptr = PTR_BYTE_ADD(&parr, 0);
+    let rst: i32 = sa_fs_rename(tp, len(tmp2), pp, len(st.path));
+    if rst != SA_STD_OK {
+        // restore appends on the pre-rewrite file
+        let (ok, nh) = aof_open_append(&st.path);
+        if ok {
+            st.file = nh;
+        } else {
+            st.broken = true;
+        };
+        return false;
+    };
+    let (ok2, nh2) = aof_open_append(&st.path);
+    if ok2 != true {
+        st.broken = true;
+        return false;
+    };
+    st.file = nh2;
+    st.size = len(data);
+    st.base_size = len(data);
+    st.unsynced = 0;
+    st.last_sync_ms = now_ms;
+    return true;
+}
+
+// ---- startup replay ----
+// Returns 0 on success (including "no file" and "file ends in a
+// truncated final record", the crash-tail case Redis also
+// tolerates), 1 on an IO error, 2 on a corrupt record mid-file.
+// A nonzero return makes the server exit 69 before it listens:
+// starting with a silently half-loaded dataset is not an option.
+
+fn aof_replay(cfg: &AofConfig, s: &Store, now_ms: i64) -> i32 {
+    let arr: [u8; 256] = [0u8; 256];
+    let i: u64 = 0;
+    while i < len(cfg.path) {
+        arr[i] = cfg.path[i];
+        i = i + 1;
+    }
+    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    let est: i32 = sa_std_fs_exists(ap, len(cfg.path));
+    if est != SA_STD_OK {
+        return 0;
+    };
+    let total: u64 = 0;
+    let lst: i32 = sa_std_fs_len(ap, len(cfg.path), &total);
+    if lst != SA_STD_OK {
+        return 1;
+    };
+    if total == 0 {
+        return 0;
+    };
+    let h: u64 = 0;
+    let ost: i32 = sa_std_fs_open_read(ap, len(cfg.path), &h);
+    if ost != SA_STD_OK {
+        return 1;
+    };
+    let data: Vec<u8> = Vec::new();
+    let off: u64 = 0;
+    while off < total {
+        let chunk: u64 = total - off;
+        if chunk > 4096 {
+            chunk = 4096;
+        };
+        let buf: [u8; 4096] = [0u8; 4096];
+        let bp: ptr = PTR_BYTE_ADD(&buf, 0);
+        let rst: i32 = sa_std_fs_file_read_exact_at(h, bp, chunk, off);
+        if rst != SA_STD_OK {
+            let cc = sa_fs_file_close(h);
+            return 1;
+        };
+        let j: u64 = 0;
+        while j < chunk {
+            data.push(buf[j]);
+            j = j + 1;
+        }
+        off = off + chunk;
+    }
+    let cc2 = sa_fs_file_close(h);
+    // Execute the record stream. Replay is stricter than the
+    // wire parser: the journal only ever writes multibulk
+    // records, so a record not starting with '*' is corruption
+    // here (on the wire the same bytes would be an inline
+    // command; in the file they can only be damage).
+    let pos: u64 = 0;
+    while pos < len(data) {
+        if data[pos] != 42 {
+            return 2;
+        };
+        let pr = resp_parse(&data, pos);
+        if pr.state == PARSE_ERROR {
+            return 2;
+        };
+        if pr.state == PARSE_INCOMPLETE {
+            // truncated tail: the writer crashed mid-record;
+            // everything before it is complete and applied
+            return 0;
+        };
+        pos = pos + pr.consumed;
+        if pr.state == PARSE_OK {
+            let sink_out: Vec<u8> = Vec::new();
+            let sink_reply = exec_command(s, &pr.args, now_ms, sink_out);
+        };
+    }
+    return 0;
+}
+
+// ---- model B (snapshot) interface reservation ----
+// The 2026-10-28 ruling chose AOF (model A); whole-dataset
+// snapshots (model B) and a std fork primitive (model C) were
+// explicitly NOT chosen. This entry point exists so a future
+// ruling can add model B without reshaping call sites. It is
+// not implemented, not wired to any command, and says so.
+fn snapshot_save(st: &AofState, s: &Store) -> i32 {
+    return SNAPSHOT_NOT_IMPLEMENTED;
+}
