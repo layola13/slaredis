@@ -142,7 +142,20 @@ fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64, auth: &AuthC
                         };
                         ran = true;
                     } else {
-                        if aof.enabled && aof.broken && journal_is_write(&pr.args) {
+                        // The write classification runs once per
+                        // command (F-perf-4): the M1 shape ran the
+                        // 17-way name comparison twice for every
+                        // write and, because && does not
+                        // short-circuit here, once for every read
+                        // whenever AOF was enabled. Records are
+                        // staged into aof.pending as commands
+                        // execute and flushed once per exec pass
+                        // below.
+                        let is_write: bool = false;
+                        if aof.enabled {
+                            is_write = journal_is_write(&pr.args);
+                        };
+                        if is_write && aof.broken {
                             let ob5 = conns[i].outbuf;
                             conns[i].outbuf = resp_error(ob5, STR_PTR("ERR AOF write failed: persistence is broken, writes are refused"), STR_LEN("ERR AOF write failed: persistence is broken, writes are refused"));
                             ran = true;
@@ -152,11 +165,11 @@ fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64, auth: &AuthC
                             let ob7 = exec_command(s, &pr.args, now_ms, ob6);
                             conns[i].outbuf = ob7;
                             ran = true;
-                            if aof.enabled && journal_is_write(&pr.args) {
+                            if is_write {
                                 if len(conns[i].outbuf) > before {
                                     if conns[i].outbuf[before] != 45 {
                                         let rec = journal_record(&pr.args, now_ms);
-                                        let okj = aof_append(aof, &rec, now_ms);
+                                        aof.pending.push(rec);
                                     };
                                 };
                             };
@@ -166,6 +179,16 @@ fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64, auth: &AuthC
             };
         };
     }
+    // One flush for the whole exec pass (F-perf-4): the staged
+    // records reach the file here, still before this
+    // connection's replies are flushed by the caller (the AOF
+    // ordering contract in this function's header comment). A
+    // failure marks the AOF broken inside aof_flush_pending;
+    // this pass's replies were already generated, exactly as
+    // they were when a per-record append failed in M1.
+    if aof.enabled {
+        let okf = aof_flush_pending(aof, now_ms);
+    };
     // compact the input buffer: drop the consumed prefix
     if conns[i].inoff == len(conns[i].inbuf) {
         conns[i].inbuf = Vec::new();

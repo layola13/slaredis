@@ -56,6 +56,19 @@ struct AofState {
     last_sync_ms: i64,
     unsynced: u64,
     broken: bool,
+    // Journal records staged by the current exec pass (F-perf-4),
+    // one finished record Vec per element. Records are kept as
+    // separate chunks on purpose: appending record bytes into
+    // one growing byte buffer through the value-threaded resp
+    // writers costs quadratically in the accumulated length in
+    // this stack (measured: a P=16 AOF pass collapsed ~10x, and
+    // an unbounded accumulator wedges outright), while a chunk
+    // push is the same direct field-push shape conn_read uses
+    // for inbuf. aof_flush_pending writes the chunks in order
+    // and applies the fsync policy once per pass. Empty between
+    // passes; aof_rewrite flushes it before serializing so no
+    // staged record can land after the rename.
+    pending: Vec<Vec<u8>>,
 }
 
 fn aof_state_new(cfg: &AofConfig) -> AofState {
@@ -69,6 +82,7 @@ fn aof_state_new(cfg: &AofConfig) -> AofState {
         last_sync_ms: 0,
         unsynced: 0,
         broken: false,
+        pending: Vec::new(),
     };
 }
 
@@ -161,25 +175,43 @@ fn aof_open(st: &AofState) -> bool {
     return true;
 }
 
-// Append one journal record. Honors the fsync policy for the
-// "always" mode; "everysec" is driven by aof_tick; "no" never
-// syncs. Any IO failure marks the state broken: the caller-visible
-// consequence is that the server refuses further writes with an
-// explicit error (see server.sla) instead of silently continuing
-// unpersisted.
-fn aof_append(st: &AofState, rec: &Vec<u8>, now_ms: i64) -> bool {
+// Write the staged record chunks (st.pending) to the file in
+// order and apply the fsync policy once for the whole batch:
+// "always" syncs once per flush (i.e. once per exec pass -- the
+// same batching granularity Redis itself uses when it flushes
+// its AOF buffer per event-loop iteration, and the one place
+// batching removes real syscalls: M1 synced per record);
+// "everysec" is driven by aof_tick; "no" never syncs.
+// Size/unsynced accounting happens here, at write time, exactly
+// where the per-record append used to do it. Any IO failure
+// marks the state broken and drops the unwritten remainder of
+// the batch: the caller-visible consequence is that the server
+// refuses further writes with an explicit error (see
+// server.sla) instead of silently continuing unpersisted.
+fn aof_flush_pending(st: &AofState, now_ms: i64) -> bool {
     if st.enabled != true {
+        return true;
+    };
+    if len(st.pending) == 0 {
         return true;
     };
     if st.broken {
         return false;
     };
-    if aof_write_all(st.file, rec) != true {
-        st.broken = true;
-        return false;
-    };
-    st.size = st.size + len(rec);
-    st.unsynced = st.unsynced + len(rec);
+    let chunks = st.pending;
+    st.pending = Vec::new();
+    let total: u64 = 0;
+    let ci: u64 = 0;
+    while ci < len(chunks) {
+        if aof_write_all(st.file, &chunks[ci]) != true {
+            st.broken = true;
+            return false;
+        };
+        total = total + len(chunks[ci]);
+        ci = ci + 1;
+    }
+    st.size = st.size + total;
+    st.unsynced = st.unsynced + total;
     if st.fsync_mode == AOF_FSYNC_ALWAYS {
         let sst: i32 = sa_fs_file_sync_data(st.file);
         if sst != SA_STD_OK {
@@ -190,6 +222,20 @@ fn aof_append(st: &AofState, rec: &Vec<u8>, now_ms: i64) -> bool {
         st.last_sync_ms = now_ms;
     };
     return true;
+}
+
+// Append one journal record immediately (stage + flush). Kept
+// for single-record callers; the server's hot path stages into
+// st.pending and flushes once per exec pass instead.
+fn aof_append(st: &AofState, rec: &Vec<u8>, now_ms: i64) -> bool {
+    if st.enabled != true {
+        return true;
+    };
+    if st.broken {
+        return false;
+    };
+    st.pending.push(bytes_clone(rec));
+    return aof_flush_pending(st, now_ms);
 }
 
 // Periodic loop tick (called next to the expiry sweep): the
@@ -331,6 +377,14 @@ fn dataset_serialize(s: &Store, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
 // AOF left authoritative whenever that is still possible.
 fn aof_rewrite(st: &AofState, s: &Store, now_ms: i64) -> bool {
     if st.enabled != true {
+        return false;
+    };
+    // Staged records must be durable in the live file before the
+    // snapshot is taken: the snapshot reflects them, and nothing
+    // staged may be written after the rename (an INCR-class
+    // record landing in the new file would double-apply on
+    // replay).
+    if aof_flush_pending(st, now_ms) != true {
         return false;
     };
     let data = dataset_serialize(s, now_ms, Vec::new());

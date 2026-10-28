@@ -206,6 +206,50 @@ fn resp_bulk(out: Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
     return out;
 }
 
+// Bulk string from a string literal (pointer + length), with no
+// intermediate Vec.
+fn resp_bulk_lit(out: Vec<u8>, lit: ptr, lit_len: u64) -> Vec<u8> {
+    out.push(36);
+    out = append_i64(out, lit_len as i64);
+    out.push(13);
+    out.push(10);
+    out = bytes_push_lit(out, lit, lit_len);
+    out.push(13);
+    out.push(10);
+    return out;
+}
+
+// Bulk-string form of an integer value, serialized in place:
+// the digit count is computed arithmetically so the digits are
+// never materialized into a temporary Vec first (the journal's
+// PEXPIREAT synthesis is the hot user, F-perf-4).
+fn resp_bulk_i64(out: Vec<u8>, v: i64) -> Vec<u8> {
+    let mag: u64 = 0;
+    if v < 0 {
+        mag = (0 - (v + 1)) as u64 + 1;
+    } else {
+        mag = v as u64;
+    };
+    let digits: u64 = 1;
+    let t: u64 = mag;
+    while t >= 10 {
+        t = t / 10;
+        digits = digits + 1;
+    }
+    let total: i64 = digits as i64;
+    if v < 0 {
+        total = total + 1;
+    };
+    out.push(36);
+    out = append_i64(out, total);
+    out.push(13);
+    out.push(10);
+    out = append_i64(out, v);
+    out.push(13);
+    out.push(10);
+    return out;
+}
+
 fn resp_nil(out: Vec<u8>) -> Vec<u8> {
     out.push(36);
     out.push(45);

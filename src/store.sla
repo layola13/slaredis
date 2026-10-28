@@ -66,6 +66,14 @@ struct Entry {
     hfields: Vec<Vec<u8>>,
     hvalues: Vec<Vec<u8>>,
     litems: Vec<Vec<u8>>,
+    // Head offset of the list deque (F-perf-3): the logical list
+    // is litems[lhead .. len(litems)], so LPUSH/LPOP at the head
+    // are O(1) slot operations instead of O(n) deep-clone
+    // rebuilds. Slots below lhead hold released (empty) values.
+    // entry_clone / entry_materialized always normalize a list
+    // back to lhead == 0, so consumers outside the list commands
+    // (the AOF serializer) never see the offset.
+    lhead: u64,
     smembers: Vec<Vec<u8>>,
     zrows: Vec<ZRow>,
 }
@@ -87,6 +95,7 @@ fn entry_blank(key: &Vec<u8>, key_hash: u64, kind: u8) -> Entry {
         hfields: Vec::new(),
         hvalues: Vec::new(),
         litems: Vec::new(),
+        lhead: 0,
         smembers: Vec::new(),
         zrows: Vec::new(),
     };
@@ -110,6 +119,7 @@ fn entry_tombstone(s: &Store, i: u64) {
     s.entries[i].hfields = Vec::new();
     s.entries[i].hvalues = Vec::new();
     s.entries[i].litems = Vec::new();
+    s.entries[i].lhead = 0;
     s.entries[i].smembers = Vec::new();
     s.entries[i].zrows = Vec::new();
     s.dead_count = s.dead_count + 1;
@@ -127,6 +137,7 @@ fn entry_reset(s: &Store, i: u64, kind: u8) {
     s.entries[i].hfields = Vec::new();
     s.entries[i].hvalues = Vec::new();
     s.entries[i].litems = Vec::new();
+    s.entries[i].lhead = 0;
     s.entries[i].smembers = Vec::new();
     s.entries[i].zrows = Vec::new();
 }
@@ -141,25 +152,130 @@ fn entry_expired(s: &Store, i: u64, now_ms: i64) -> bool {
     return false;
 }
 
-// Find a live entry by key. Applies lazy expiry: an expired entry
-// is tombstoned and reported missing. Returns the index or -1.
-fn store_find(s: &Store, key: &Vec<u8>, key_hash: u64, now_ms: i64) -> i64 {
-    let i: u64 = 0;
-    while i < len(s.entries) {
-        if s.entries[i].kind != KIND_DEAD {
-            if s.entries[i].key_hash == key_hash {
-                if bytes_eq(&s.entries[i].key, key) {
-                    if entry_expired(s, i, now_ms) {
-                        entry_tombstone(s, i);
-                        return -1;
+// Logical length of the list in entry i (physical slots below
+// lhead are released headroom, not elements).
+fn list_len(s: &Store, i: u64) -> u64 {
+    return len(s.entries[i].litems) - s.entries[i].lhead;
+}
+
+// Prepend one element to the list in entry e (F-perf-3). O(1)
+// while headroom remains under lhead; when it runs out, the
+// physical vector is rebuilt once with fresh headroom roughly
+// equal to the list length, MOVING the element Vecs (header
+// copies only -- no byte clones of existing elements), so head
+// pushes stay amortized O(1). The old M1 shape rebuilt the
+// whole list with a deep clone of every element per push.
+fn list_push_head(s: &Store, e: u64, val: &Vec<u8>) {
+    if s.entries[e].lhead > 0 {
+        s.entries[e].lhead = s.entries[e].lhead - 1;
+        let h: u64 = s.entries[e].lhead;
+        s.entries[e].litems[h] = bytes_clone(val);
+        return;
+    };
+    // No headroom: rebuild with room in front. The old vector
+    // is moved out (the field move-out shape server.sla uses
+    // for connection buffers); its elements are popped off the
+    // back and written into their final slots back-to-front,
+    // preserving order with header moves only. (Local names are
+    // ph_-prefixed: after inline expansion they share the
+    // caller's register namespace, and plain names like v/idx
+    // collide with caller registers at merges -- the M1 referee
+    // minefield.)
+    let ph_n: u64 = len(s.entries[e].litems);
+    let ph_room: u64 = ph_n;
+    if ph_room < 16 {
+        ph_room = 16;
+    };
+    let ph_old = s.entries[e].litems;
+    let ph_fresh: Vec<Vec<u8>> = Vec::new();
+    let ph_k: u64 = 0;
+    while ph_k < ph_room + ph_n {
+        ph_fresh.push(Vec::new());
+        ph_k = ph_k + 1;
+    }
+    let ph_src = ph_old;
+    let ph_idx: u64 = ph_n;
+    while ph_idx > 0 {
+        ph_idx = ph_idx - 1;
+        match ph_src.pop() {
+            Some(ph_v) => {
+                ph_fresh[ph_room + ph_idx] = ph_v;
+            },
+            None => {
+            },
+        };
+    }
+    s.entries[e].litems = ph_fresh;
+    s.entries[e].lhead = ph_room - 1;
+    s.entries[e].litems[ph_room - 1] = bytes_clone(val);
+}
+
+// Remove and return the head element of the list in entry e
+// (the caller guarantees the list is non-empty). The value is
+// byte-copied out, the vacated slot is released in place and
+// lhead advances: O(1) plus one element copy, no shifting and
+// no rebuild (the old shape used Vec::remove(0)).
+fn list_pop_head(s: &Store, e: u64) -> Vec<u8> {
+    let hp_h: u64 = s.entries[e].lhead;
+    let hp_val = bytes_clone(&s.entries[e].litems[hp_h]);
+    s.entries[e].litems[hp_h] = Vec::new();
+    s.entries[e].lhead = hp_h + 1;
+    return hp_val;
+}
+
+// One scan that answers both questions the create paths used to
+// pay two full scans for (F-perf-5): the live index of `key`
+// (-1 when absent, with store_find's lazy-expiry semantics) and
+// the first tombstone slot an insert may reuse (-1 when none).
+// When the key's own entry turns out expired it is tombstoned
+// and becomes the reuse candidate, exactly as the old find-then-
+// insert sequence behaved.
+fn store_find_slot(s: &Store, key: &Vec<u8>, key_hash: u64, now_ms: i64) -> (i64, i64) {
+    let fs_dead: i64 = -1;
+    let fs_i: u64 = 0;
+    while fs_i < len(s.entries) {
+        if s.entries[fs_i].kind == KIND_DEAD {
+            if fs_dead < 0 {
+                fs_dead = fs_i as i64;
+            };
+        } else {
+            if s.entries[fs_i].key_hash == key_hash {
+                if bytes_eq(&s.entries[fs_i].key, key) {
+                    if entry_expired(s, fs_i, now_ms) {
+                        entry_tombstone(s, fs_i);
+                        if fs_dead < 0 {
+                            fs_dead = fs_i as i64;
+                        };
+                        return (-1, fs_dead);
                     };
-                    return i as i64;
+                    return (fs_i as i64, fs_dead);
                 };
             };
         };
-        i = i + 1;
+        fs_i = fs_i + 1;
     }
-    return -1;
+    return (-1, fs_dead);
+}
+
+// Find a live entry by key. Applies lazy expiry: an expired entry
+// is tombstoned and reported missing. Returns the index or -1.
+fn store_find(s: &Store, key: &Vec<u8>, key_hash: u64, now_ms: i64) -> i64 {
+    let (idx, _dead) = store_find_slot(s, key, key_hash, now_ms);
+    return idx;
+}
+
+// Insert a fresh entry of the given kind into the tombstone slot
+// `dead` (from store_find_slot), or append when dead < 0. The
+// caller has verified the key is absent.
+fn store_insert_at(s: &Store, key: &Vec<u8>, key_hash: u64, kind: u8, dead: i64) -> i64 {
+    if dead >= 0 {
+        let d: u64 = dead as u64;
+        s.entries[d] = entry_blank(key, key_hash, kind);
+        s.dead_count = s.dead_count - 1;
+        return dead;
+    };
+    s.entries.push(entry_blank(key, key_hash, kind));
+    return (len(s.entries) - 1) as i64;
 }
 
 // Insert a fresh entry of the given kind (caller has verified the
@@ -168,14 +284,11 @@ fn store_insert(s: &Store, key: &Vec<u8>, key_hash: u64, kind: u8) -> i64 {
     let i: u64 = 0;
     while i < len(s.entries) {
         if s.entries[i].kind == KIND_DEAD {
-            s.entries[i] = entry_blank(key, key_hash, kind);
-            s.dead_count = s.dead_count - 1;
-            return i as i64;
+            return store_insert_at(s, key, key_hash, kind, i as i64);
         };
         i = i + 1;
     }
-    s.entries.push(entry_blank(key, key_hash, kind));
-    return (len(s.entries) - 1) as i64;
+    return store_insert_at(s, key, key_hash, kind, -1);
 }
 
 // Switch a fresh aggregate entry to the packed representation
@@ -213,7 +326,9 @@ fn entry_clone(s: &Store, i: u64) -> Entry {
         e.hvalues.push(bytes_clone(&s.entries[i].hvalues[k]));
         k = k + 1;
     }
-    let m: u64 = 0;
+    // Lists clone in logical order with the head offset
+    // normalized away: the clone's lhead stays 0 (entry_blank).
+    let m: u64 = s.entries[i].lhead;
     while m < len(s.entries[i].litems) {
         e.litems.push(bytes_clone(&s.entries[i].litems[m]));
         m = m + 1;

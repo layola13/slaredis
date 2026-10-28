@@ -62,37 +62,45 @@ fn err_invalid_expire_set(out: Vec<u8>) -> Vec<u8> {
     return resp_error(out, STR_PTR("ERR invalid expire time in 'set' command"), STR_LEN("ERR invalid expire time in 'set' command"));
 }
 
+// lookup_typed that also reports the first tombstone slot the
+// same single scan passed (F-perf-5): create paths insert into
+// it directly instead of paying a second full scan.
+fn lookup_typed_slot(s: &Store, key: &Vec<u8>, kind: u8, now_ms: i64) -> (i64, i64) {
+    let (idx, dead) = store_find_slot(s, key, bytes_hash(key), now_ms);
+    if idx < 0 {
+        return (-1, dead);
+    };
+    if s.entries[idx as u64].kind != kind {
+        return (-2, dead);
+    };
+    return (idx, dead);
+}
+
 // Find a live entry of exactly `kind`: index >= 0 hit, -1 missing,
 // -2 present with a different kind (caller replies WRONGTYPE).
 fn lookup_typed(s: &Store, key: &Vec<u8>, kind: u8, now_ms: i64) -> i64 {
-    let idx: i64 = store_find(s, key, bytes_hash(key), now_ms);
-    if idx < 0 {
-        return -1;
-    };
-    if s.entries[idx as u64].kind != kind {
-        return -2;
-    };
+    let (idx, _dead) = lookup_typed_slot(s, key, kind, now_ms);
     return idx;
 }
 
 // lookup_typed plus creation of a missing key with the given kind.
 fn lookup_or_create(s: &Store, key: &Vec<u8>, kind: u8, now_ms: i64) -> i64 {
-    let idx: i64 = lookup_typed(s, key, kind, now_ms);
+    let (idx, dead) = lookup_typed_slot(s, key, kind, now_ms);
     if idx != -1 {
         return idx;
     };
-    return store_insert(s, key, bytes_hash(key), kind);
+    return store_insert_at(s, key, bytes_hash(key), kind, dead);
 }
 
 // lookup_or_create for aggregate kinds (hash / set / zset): a
 // freshly created key starts in the packed (listpack)
 // representation; the plain path above stays for lists.
 fn lookup_or_create_agg(s: &Store, key: &Vec<u8>, kind: u8, now_ms: i64) -> i64 {
-    let idx: i64 = lookup_typed(s, key, kind, now_ms);
+    let (idx, dead) = lookup_typed_slot(s, key, kind, now_ms);
     if idx != -1 {
         return idx;
     };
-    let ni: i64 = store_insert(s, key, bytes_hash(key), kind);
+    let ni: i64 = store_insert_at(s, key, bytes_hash(key), kind, dead);
     entry_make_packed(s, ni as u64);
     return ni;
 }
@@ -204,13 +212,16 @@ fn cmd_set(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8>
             };
         };
     }
-    let idx: i64 = store_find(s, &args[1], bytes_hash(&args[1]), now_ms);
+    // One scan and one hash for the find-or-insert (F-perf-5):
+    // the M1 shape hashed the key twice and scanned twice.
+    let hash: u64 = bytes_hash(&args[1]);
+    let (idx, dead) = store_find_slot(s, &args[1], hash, now_ms);
     let slot: u64 = 0;
     if idx >= 0 {
         slot = idx as u64;
         entry_reset(s, slot, KIND_STRING);
     } else {
-        slot = store_insert(s, &args[1], bytes_hash(&args[1]), KIND_STRING) as u64;
+        slot = store_insert_at(s, &args[1], hash, KIND_STRING, dead) as u64;
     };
     s.entries[slot].sval = bytes_clone(&args[2]);
     s.entries[slot].expire_ms = deadline;
@@ -289,7 +300,8 @@ fn cmd_type(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
 }
 
 fn incr_by(s: &Store, key: &Vec<u8>, delta: i64, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
-    let idx0: i64 = store_find(s, key, bytes_hash(key), now_ms);
+    let hash: u64 = bytes_hash(key);
+    let (idx0, dead0) = store_find_slot(s, key, hash, now_ms);
     if idx0 >= 0 {
         if s.entries[idx0 as u64].kind != KIND_STRING {
             return err_wrongtype(out);
@@ -317,7 +329,7 @@ fn incr_by(s: &Store, key: &Vec<u8>, delta: i64, now_ms: i64, out: Vec<u8>) -> V
     if idx0 >= 0 {
         slot = idx0 as u64;
     } else {
-        slot = store_insert(s, key, bytes_hash(key), KIND_STRING) as u64;
+        slot = store_insert_at(s, key, hash, KIND_STRING, dead0) as u64;
     };
     let text: Vec<u8> = Vec::new();
     let text2 = append_i64(text, nv);
@@ -709,18 +721,13 @@ fn cmd_lpush(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u
     let e: u64 = idx as u64;
     let i: u64 = 2;
     while i < len(args) {
-        // prepend: rebuild items as [arg] ++ old items (deep copies)
-        let fresh: Vec<Vec<u8>> = Vec::new();
-        fresh.push(bytes_clone(&args[i]));
-        let j: u64 = 0;
-        while j < len(s.entries[e].litems) {
-            fresh.push(bytes_clone(&s.entries[e].litems[j]));
-            j = j + 1;
-        }
-        s.entries[e].litems = fresh;
+        // O(1) amortized head insert into the headroom under
+        // lhead (F-perf-3); the M1 shape rebuilt the list with
+        // a deep clone of every element per push.
+        list_push_head(s, e, &args[i]);
         i = i + 1;
     }
-    return resp_int(out, len(s.entries[e].litems) as i64);
+    return resp_int(out, list_len(s, e) as i64);
 }
 
 fn cmd_rpush(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
@@ -737,7 +744,7 @@ fn cmd_rpush(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u
         s.entries[e].litems.push(bytes_clone(&args[i]));
         i = i + 1;
     }
-    return resp_int(out, len(s.entries[e].litems) as i64);
+    return resp_int(out, list_len(s, e) as i64);
 }
 
 // Shared LPOP/RPOP body. from_head selects the side; count < 0
@@ -768,26 +775,30 @@ fn pop_side(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>, from_head
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
+    // Each side pops in its own function, where the popped value
+    // is produced and consumed in straight-line code. Sharing
+    // one body across the sides forces the value through branch
+    // merges, which this compiler's referee rejects
+    // (PhiStateConflict for a call-result binding vs a match-arm
+    // binding) or misreads (a Vec reassigned inside a branch and
+    // borrowed after the merge reads the pre-branch value).
+    if from_head {
+        return pop_head(s, e, count, out);
+    };
+    return pop_tail(s, e, count, out);
+}
+
+// LPOP body: head pops advance lhead (list_pop_head), O(1) each.
+fn pop_head(s: &Store, e: u64, count: i64, out: Vec<u8>) -> Vec<u8> {
     if count < 0 {
-        if from_head {
-            let v = s.entries[e].litems.remove(0);
-            out = resp_bulk(out, &v);
-        } else {
-            match s.entries[e].litems.pop() {
-                Some(v) => {
-                    out = resp_bulk(out, &v);
-                },
-                None => {
-                    out = resp_nil(out);
-                },
-            };
-        };
-        if len(s.entries[e].litems) == 0 {
+        let v = list_pop_head(s, e);
+        out = resp_bulk(out, &v);
+        if list_len(s, e) == 0 {
             entry_tombstone(s, e);
         };
         return out;
     };
-    let avail: i64 = len(s.entries[e].litems) as i64;
+    let avail: i64 = list_len(s, e) as i64;
     let take: i64 = count;
     if take > avail {
         take = avail;
@@ -795,22 +806,51 @@ fn pop_side(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>, from_head
     out = resp_array_header(out, take);
     let k: i64 = 0;
     while k < take {
-        if from_head {
-            let v2 = s.entries[e].litems.remove(0);
-            out = resp_bulk(out, &v2);
-        } else {
-            match s.entries[e].litems.pop() {
-                Some(v2) => {
-                    out = resp_bulk(out, &v2);
-                },
-                None => {
-                    out = resp_nil(out);
-                },
-            };
+        let v2 = list_pop_head(s, e);
+        out = resp_bulk(out, &v2);
+        k = k + 1;
+    }
+    if list_len(s, e) == 0 {
+        entry_tombstone(s, e);
+    };
+    return out;
+}
+
+// RPOP body: the physical back of litems is the logical back.
+fn pop_tail(s: &Store, e: u64, count: i64, out: Vec<u8>) -> Vec<u8> {
+    if count < 0 {
+        match s.entries[e].litems.pop() {
+            Some(v) => {
+                out = resp_bulk(out, &v);
+            },
+            None => {
+                out = resp_nil(out);
+            },
+        };
+        if list_len(s, e) == 0 {
+            entry_tombstone(s, e);
+        };
+        return out;
+    };
+    let avail: i64 = list_len(s, e) as i64;
+    let take: i64 = count;
+    if take > avail {
+        take = avail;
+    };
+    out = resp_array_header(out, take);
+    let k: i64 = 0;
+    while k < take {
+        match s.entries[e].litems.pop() {
+            Some(v2) => {
+                out = resp_bulk(out, &v2);
+            },
+            None => {
+                out = resp_nil(out);
+            },
         };
         k = k + 1;
     }
-    if len(s.entries[e].litems) == 0 {
+    if list_len(s, e) == 0 {
         entry_tombstone(s, e);
     };
     return out;
@@ -844,15 +884,16 @@ fn cmd_lrange(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<
         return err_wrongtype(out);
     };
     let e: u64 = idx as u64;
-    let L: i64 = len(s.entries[e].litems) as i64;
+    let L: i64 = list_len(s, e) as i64;
     let (rok, a, b) = range_normalize(start, stop, L);
     if rok != true {
         return resp_array_header(out, 0);
     };
     out = resp_array_header(out, b - a + 1);
+    let head: u64 = s.entries[e].lhead;
     let i: i64 = a;
     while i <= b {
-        out = resp_bulk(out, &s.entries[e].litems[i as u64]);
+        out = resp_bulk(out, &s.entries[e].litems[head + (i as u64)]);
         i = i + 1;
     }
     return out;
@@ -869,7 +910,7 @@ fn cmd_llen(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
     if idx == -2 {
         return err_wrongtype(out);
     };
-    return resp_int(out, len(s.entries[idx as u64].litems) as i64);
+    return resp_int(out, list_len(s, idx as u64) as i64);
 }
 
 // ---- set commands ----

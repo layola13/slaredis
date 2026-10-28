@@ -57,14 +57,15 @@ fn journal_deadline(now_ms: i64, delta_ms: i64) -> i64 {
 }
 
 // Append a synthesized `PEXPIREAT key deadline` record to out.
+// Serialized directly into out (F-perf-4): the M1 shape built a
+// temporary argument vector with a cloned key and a materialized
+// digit string, then re-serialized the whole thing.
 fn journal_push_pexpireat(out: Vec<u8>, key: &Vec<u8>, deadline: i64) -> Vec<u8> {
-    let t: Vec<Vec<u8>> = Vec::new();
-    let c0: Vec<u8> = Vec::new();
-    t.push(bytes_push_lit(c0, STR_PTR("PEXPIREAT"), STR_LEN("PEXPIREAT")));
-    t.push(bytes_clone(key));
-    let c2: Vec<u8> = Vec::new();
-    t.push(append_i64(c2, deadline));
-    return resp_write_command(out, &t);
+    out = resp_array_header(out, 3);
+    out = resp_bulk_lit(out, STR_PTR("PEXPIREAT"), STR_LEN("PEXPIREAT"));
+    out = resp_bulk(out, key);
+    out = resp_bulk_i64(out, deadline);
+    return out;
 }
 
 // Serialize args[lo..hi] as one record (no cloning of elements).
@@ -78,9 +79,12 @@ fn journal_push_range(out: Vec<u8>, args: &Vec<Vec<u8>>, lo: u64, hi: u64) -> Ve
     return out;
 }
 
-// The AOF record bytes for one executed write command.
-fn journal_record(args: &Vec<Vec<u8>>, now_ms: i64) -> Vec<u8> {
-    let out: Vec<u8> = Vec::new();
+// The AOF record bytes for one executed write command,
+// appended to `out` (an append-into form kept for callers that
+// assemble multi-record payloads; the server's per-pass staging
+// keeps one record per chunk -- see AofState.pending for why
+// records are not accumulated into a single growing buffer).
+fn journal_record_into(out: Vec<u8>, args: &Vec<Vec<u8>>, now_ms: i64) -> Vec<u8> {
     if bytes_eq_lit_ci(&args[0], STR_PTR("SET"), STR_LEN("SET")) {
         // Find an EX/PX option pair (the M0 SET grammar has only
         // those options, each with one value).
@@ -139,4 +143,11 @@ fn journal_record(args: &Vec<Vec<u8>>, now_ms: i64) -> Vec<u8> {
         return out;
     };
     return journal_push_range(out, args, 0, len(args));
+}
+
+// The AOF record bytes for one executed write command, in a
+// fresh vector (single-record callers: tests, tooling).
+fn journal_record(args: &Vec<Vec<u8>>, now_ms: i64) -> Vec<u8> {
+    let out: Vec<u8> = Vec::new();
+    return journal_record_into(out, args, now_ms);
 }
