@@ -4,11 +4,39 @@
 // docs/M0_DELIVERY.md): ONE process, ONE thread, a round-robin loop
 // over nonblocking sockets -- the same shape as Redis itself, so a
 // command always executes atomically and the store needs no lock.
-// The loop: drain pending accepts, then for each connection pump
-// one read chunk, execute every complete command in its buffer,
-// flush its out buffer, and reap connections that are done. The
-// expiry sweeper runs inside the loop every ~100 ms. A round with
-// no progress sleeps 1 ms instead of spinning.
+// The loop: wait for readiness, drain pending accepts, then for
+// each connection pump one read chunk, execute every complete
+// command in its buffer, flush its out buffer, and reap
+// connections that are done. The expiry sweeper runs inside the
+// loop every ~100 ms.
+//
+// The wait is a blocking poll (sa_std_net_poll_wait, the F-perf-1
+// readiness face): the M0/M1 loop scanned every socket each round
+// and slept 1 ms when a round made no progress; the poll loop
+// blocks until a socket is ready or the next timer deadline
+// (expiry sweep, AOF everysec fsync) arrives, whichever is first.
+// Readiness is level-triggered, so a ready socket reported by the
+// wait is only a gate on work the old loop attempted anyway: the
+// accept drain runs when the listener reports READ, a connection
+// read runs when the connection reports READ or ERROR (a hangup
+// reports READ|ERROR; the read then returns EOF), and flushes are
+// still attempted whenever output is pending. Per-round timer
+// behavior is unchanged: the wait budget ends at the next sweep /
+// everysec deadline, so neither cadence can be starved by an idle
+// poll. Connections accepted in the current round were not part
+// of its wait set and are read unconditionally, exactly as the
+// old loop read them in their accept round.
+//
+// The wait set is staged in chunks of POLL_CHUNK handles, far
+// under the face's 4096-handle cap, so no connection is ever
+// left out of a wait and no call is ever oversized. Closed
+// connections are excluded from the set: their handles are
+// already closed, and a closed handle would fail the whole wait
+// loudly with INVALID_HANDLE. If a wait itself returns a non-OK
+// status, that round falls back -- explicitly, here and not
+// silently -- to the pre-poll behavior (ungated scan, 1 ms sleep
+// when a round makes no progress): a broken readiness face must
+// degrade latency, never correctness or liveness.
 //
 // Measured std semantics this relies on (probe_loop, 2026-10-28):
 // a would-block accept or read returns SA_STD_ERR_IO (6), NOT
@@ -17,6 +45,7 @@
 // connection still terminates via EOF on a later round or a failed
 // flush followed by EOF.
 @import "sa_std/net.sai"
+@import "sa_std/net.sla"
 @import "sa_std/time.sai"
 @import "sa_std/fs.sai"
 @import "sa_std/status.sla"
@@ -43,6 +72,10 @@ struct Conn {
     eof: bool,
     close_after_flush: bool,
     authed: bool,
+    // Readiness bits (SA_NET_POLL_*) from the current round's
+    // wait; rewritten for every open connection on every round
+    // the wait succeeds, meaningless on rounds it does not.
+    ready: u32,
 }
 
 fn conn_new(stream: u64, authed: bool) -> Conn {
@@ -56,6 +89,7 @@ fn conn_new(stream: u64, authed: bool) -> Conn {
         eof: false,
         close_after_flush: false,
         authed: authed,
+        ready: 0,
     };
 }
 
@@ -246,6 +280,141 @@ fn conn_drained(conns: &Vec<Conn>, i: u64) -> bool {
     return false;
 }
 
+// Handles staged per poll call: far under the readiness face's
+// SA_NET_POLL_MAX_HANDLES cap (4096), so a wait set is built from
+// POLL_CHUNK-sized calls no matter how many connections exist,
+// and no connection is ever excluded from a round's wait.
+const POLL_CHUNK: u64 = 128;
+
+// The wait budget for one round, in milliseconds: time until
+// the next periodic deadline -- the expiry sweep (~100 ms
+// cadence, same as the pre-poll loop) or, when the AOF everysec
+// policy has unsynced bytes, the next fsync deadline -- clamped
+// to [0, 100]. A busy round re-enters the wait immediately
+// (readiness is level-triggered, so pending work returns at
+// once); an idle round wakes exactly at its next deadline, so
+// neither the sweep nor the everysec fsync can be starved by
+// the poll the way a fixed sleep could starve them.
+fn poll_wait_budget(now_ms: i64, last_sweep: i64, aof: &AofState) -> i32 {
+    let budget: i64 = last_sweep + 100 - now_ms;
+    if aof.enabled {
+        if aof.broken != true {
+            if aof.fsync_mode == AOF_FSYNC_EVERYSEC {
+                if aof.unsynced > 0 {
+                    let d: i64 = aof.last_sync_ms + 1000 - now_ms;
+                    if d < budget {
+                        budget = d;
+                    };
+                };
+            };
+        };
+    };
+    if budget < 0 {
+        budget = 0;
+    };
+    if budget > 100 {
+        budget = 100;
+    };
+    return budget as i32;
+}
+
+// One round of readiness waiting: the listener plus every open
+// connection, in POLL_CHUNK-sized calls. The first call carries
+// the round's timeout; later chunks are sampled with timeout 0
+// (level triggering means anything that became ready during the
+// first call is still reported). Results land in Conn.ready for
+// open connections and in the returned bits for the listener.
+// Returns SA_STD_OK when every chunk waited cleanly; on the
+// first non-OK chunk status the status is returned as-is and
+// the caller treats the round as unwatched (see the header
+// comment for the explicit error path). Closed connections are
+// never staged (their handles are closed; see header comment).
+// Returns (status, listener ready bits); the bits are 0 when
+// the status is not SA_STD_OK.
+//
+// The staging arrays live in this helper on purpose, hoisted to
+// pointers once and reused across calls: passing several inline
+// PTR_BYTE_ADD(&field, 0) expressions for one struct in a single
+// call is a known consumed-register trap in this toolchain (the
+// F-perf-1 probe record), and per-chunk re-staging from the
+// connection table keeps every array at POLL_CHUNK entries.
+fn poll_wait_round(listener: u64, conns: &Vec<Conn>, timeout_ms: i32) -> (i32, u32) {
+    let hs: [u64; 128] = [0u64; 128];
+    let ins: [u32; 128] = [0u32; 128];
+    let rds: [u32; 128] = [0u32; 128];
+    let hp: ptr = PTR_BYTE_ADD(&hs, 0);
+    let ip: ptr = PTR_BYTE_ADD(&ins, 0);
+    let rp: ptr = PTR_BYTE_ADD(&rds, 0);
+    let ready_count: u64 = 0;
+    let listener_bits: u32 = 0;
+    let waited: bool = false;
+    let staged_listener: bool = false;
+    let next_ci: u64 = 0;
+    let done: bool = false;
+    while done != true {
+        // stage one chunk: the listener first (first chunk
+        // only), then open connections in table order
+        let n: u64 = 0;
+        let chunk_start_ci: u64 = next_ci;
+        let chunk_has_listener: bool = false;
+        if staged_listener != true {
+            hs[n] = listener;
+            ins[n] = SA_NET_POLL_READ;
+            n = n + 1;
+            chunk_has_listener = true;
+            staged_listener = true;
+        };
+        while n < POLL_CHUNK {
+            if next_ci >= len(conns) {
+                break;
+            };
+            if conns[next_ci].open {
+                hs[n] = conns[next_ci].stream;
+                let it: u32 = 0;
+                if conns[next_ci].eof != true {
+                    it = it + SA_NET_POLL_READ;
+                };
+                if conns[next_ci].outoff < len(conns[next_ci].outbuf) {
+                    it = it + SA_NET_POLL_WRITE;
+                };
+                ins[n] = it;
+                n = n + 1;
+            };
+            next_ci = next_ci + 1;
+        }
+        let tmo: i32 = 0;
+        if waited != true {
+            tmo = timeout_ms;
+        };
+        let st: i32 = sa_std_net_poll_wait(hp, ip, n, tmo, rp, &ready_count);
+        waited = true;
+        if st != SA_STD_OK {
+            return (st, 0);
+        };
+        // scatter this chunk's ready bits back: re-walk the same
+        // sequence the staging walk produced (listener first,
+        // then open connections from chunk_start_ci) -- single
+        // thread, nothing mutated the table in between
+        let slot: u64 = 0;
+        if chunk_has_listener {
+            listener_bits = rds[slot];
+            slot = slot + 1;
+        };
+        let ci: u64 = chunk_start_ci;
+        while slot < n {
+            if conns[ci].open {
+                conns[ci].ready = rds[slot];
+                slot = slot + 1;
+            };
+            ci = ci + 1;
+        }
+        if next_ci >= len(conns) {
+            done = true;
+        };
+    }
+    return (SA_STD_OK, listener_bits);
+}
+
 // Run forever; returns only on setup failure (exit-code contract
 // documented in README.md). With AOF enabled, startup replays the
 // file into the store and opens the append handle before the
@@ -286,32 +455,68 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: Ao
     let conns: Vec<Conn> = Vec::new();
     let last_sweep: i64 = sa_time_unix_ms();
     while true {
+        // The round opens with the readiness wait (see the
+        // header comment): it blocks until something is ready
+        // or the next timer deadline arrives. polled_len pins
+        // the table length the wait covered; connections
+        // accepted below it are read unconditionally this round.
+        let wait_now: i64 = sa_time_unix_ms();
+        let budget: i32 = poll_wait_budget(wait_now, last_sweep, &aof);
+        let (pst, lis_ready) = poll_wait_round(listener, &conns, budget);
+        let poll_ok: bool = pst == SA_STD_OK;
+        let polled_len: u64 = len(conns);
         let progress: bool = false;
-        // drain pending accepts (bounded per round)
-        let accepts: i64 = 0;
-        while accepts < 64 {
-            let h: u64 = 0;
-            let ast: i32 = sa_std_net_tcp_accept(listener, &h);
-            if ast != SA_STD_OK {
-                break;
-            };
-            if h == 0 {
-                break;
-            };
-            let nb: i32 = sa_std_net_tcp_stream_set_nonblocking(h, 1);
-            conns.push(conn_new(h, auth.required != true));
-            progress = true;
-            accepts = accepts + 1;
-        }
+        // drain pending accepts (bounded per round); gated on
+        // the listener reporting READ when the wait succeeded --
+        // an unwatched listener would only return would-block
+        if poll_ok != true || (lis_ready & SA_NET_POLL_READ) != 0 {
+            let accepts: i64 = 0;
+            while accepts < 64 {
+                let h: u64 = 0;
+                let ast: i32 = sa_std_net_tcp_accept(listener, &h);
+                if ast != SA_STD_OK {
+                    break;
+                };
+                if h == 0 {
+                    break;
+                };
+                let nb: i32 = sa_std_net_tcp_stream_set_nonblocking(h, 1);
+                conns.push(conn_new(h, auth.required != true));
+                progress = true;
+                accepts = accepts + 1;
+            }
+        };
         let now_ms: i64 = sa_time_unix_ms();
         let ci: u64 = 0;
         while ci < len(conns) {
             if conns[ci].open {
-                if conn_read(&conns, ci) {
-                    progress = true;
+                // read gate: on a watched round only a
+                // connection reporting READ or ERROR is read
+                // (anything else would return would-block);
+                // connections beyond the wait set (accepted
+                // this round) and unwatched rounds read as
+                // the pre-poll loop did
+                let rbits: u32 = SA_NET_POLL_READ + SA_NET_POLL_ERROR;
+                if poll_ok {
+                    if ci < polled_len {
+                        rbits = conns[ci].ready;
+                    };
                 };
-                if conn_exec_all(s, &conns, ci, now_ms, &auth, &aof) {
-                    progress = true;
+                let rd: bool = false;
+                if (rbits & (SA_NET_POLL_READ + SA_NET_POLL_ERROR)) != 0 {
+                    rd = conn_read(&conns, ci);
+                    if rd {
+                        progress = true;
+                    };
+                };
+                // execute when this round brought bytes, when
+                // an earlier read left a complete command
+                // buffered (inoff < inbuf len is the leftover
+                // test), or on an unwatched round
+                if rd || conns[ci].inoff < len(conns[ci].inbuf) || poll_ok != true {
+                    if conn_exec_all(s, &conns, ci, now_ms, &auth, &aof) {
+                        progress = true;
+                    };
                 };
                 if conn_flush(&conns, ci) {
                     progress = true;
@@ -350,6 +555,7 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: Ao
                             eof: conns[m].eof,
                             close_after_flush: conns[m].close_after_flush,
                             authed: conns[m].authed,
+                            ready: conns[m].ready,
                         });
                     };
                     m = m + 1;
@@ -362,8 +568,17 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: Ao
             last_sweep = now_ms;
         };
         aof_tick(&aof, s, now_ms);
-        if progress != true {
-            THREAD_SLEEP_MS(1);
+        // No idle sleep on the poll path: the wait at the top
+        // of the round already blocked for readiness or the
+        // next deadline. Only an unwatched round (the wait
+        // itself failed; see the header comment) keeps the
+        // pre-poll 1 ms no-progress sleep, so a broken
+        // readiness face degrades to the old cadence instead
+        // of spinning.
+        if poll_ok != true {
+            if progress != true {
+                THREAD_SLEEP_MS(1);
+            };
         };
     }
     return 0;

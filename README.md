@@ -8,7 +8,10 @@ that builds the rest of the SA ecosystem builds this server.
 Status: **M1** — M0 plus listpack compact encodings, AUTH, and
 AOF persistence. See `docs/M0_DELIVERY.md` for the M0 record,
 `docs/PERSISTENCE.md` for the persistence decision and design,
-and `docs/M1_DELIVERY.md` for the M1 record.
+and `docs/M1_DELIVERY.md` for the M1 record. The 2026-10-29
+improvement line (application-layer perf integration + the
+poll-based event loop) is recorded in
+`docs/IMPROVE_DELIVERY.md`.
 
 ## Commands
 
