@@ -1,0 +1,85 @@
+// repro_cond_move_loop.sla -- minimal repro of a referee shape
+// defect found during slaredis M1 (entry_decode_pack's original
+// form, distilled).
+//
+// Shape: inside a loop, a Vec value is materialized per iteration
+// and moved into an aggregate ONLY on a parse-gated branch, while
+// its sibling value is (a) moved on the other first-level branch
+// and (b) merely borrowed on the parse branch. The three
+// observed failure forms of this shape family, in the order the
+// M1 code hit them:
+//
+//   1. PhiStateConflict (1015): "register 'name': expected
+//      Consumed, actual Active" at the loop merge.
+//   2. Releasing the value on the non-consuming path with
+//      `!name` -> UseAfterMove (1009) at the release itself.
+//   3. Binding the value to a sink local on the non-consuming
+//      path -> the compiler emits the value's release at a merge
+//      where the register is out of scope: UnknownRegister
+//      (1007) at the generated `!name`.
+//
+// Workaround used by M1 (and the reason this is a repro, not
+// live code): materialize the value only on the consuming path
+// (remember its position, decode after the gate passes), so the
+// move is unconditional within its scope. See
+// src/store.sla entry_decode_pack.
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/core/slice.sa"
+
+struct Pair {
+    name: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+struct Bag {
+    names: Vec<Vec<u8>>,
+    scores: Vec<f64>,
+}
+
+fn fake_value(tag: u8, n: u64) -> Vec<u8> {
+    let v: Vec<u8> = Vec::new();
+    let i: u64 = 0;
+    while i < n {
+        v.push(tag);
+        i = i + 1;
+    }
+    return v;
+}
+
+// Returns (parsed_ok, value): stands in for a text->f64 parse.
+fn fake_parse(a: &Vec<u8>) -> (bool, f64) {
+    if len(a) == 0 {
+        return (false, 0.0);
+    };
+    return (true, 1.5);
+}
+
+fn collect(pairs: &Vec<Pair>, as_hash: bool) -> Bag {
+    let bag = Bag { names: Vec::new(), scores: Vec::new() };
+    let i: u64 = 0;
+    while i < len(pairs) {
+        let name = fake_value(65, 2);
+        let payload = fake_value(66, 2);
+        if as_hash {
+            bag.names.push(name);
+            bag.scores.push(0.0);
+            let sink_payload = payload;
+        } else {
+            let (ok, sc) = fake_parse(&payload);
+            if ok {
+                bag.names.push(name);
+                bag.scores.push(sc);
+            };
+        };
+        i = i + 1;
+    }
+    return bag;
+}
+
+fn main() -> i32 {
+    let pairs: Vec<Pair> = Vec::new();
+    pairs.push(Pair { name: fake_value(97, 1), payload: fake_value(49, 1) });
+    let b = collect(&pairs, false);
+    return len(b.names) as i32;
+}

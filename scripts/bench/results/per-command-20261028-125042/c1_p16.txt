@@ -1,0 +1,5 @@
+== GET c1 P16 ==
+-- sla
+  throughput summary: 15847.86 requests per second
+-- redis
+  throughput summary: 448430.47 requests per second

@@ -1,0 +1,17 @@
+== single client, -n 20000 -d 3 ==
+-- redis get c1
+  throughput summary: 28089.89 requests per second
+          avg       min       p50       p95       p99       max
+p50=0.031 p99=0.063
+-- redis set c1
+  throughput summary: 28050.49 requests per second
+          avg       min       p50       p95       p99       max
+p50=0.031 p99=0.087
+-- sla get c1
+  throughput summary: 2604.84 requests per second
+          avg       min       p50       p95       p99       max
+p50=0.095 p99=1.239
+-- sla set c1
+  throughput summary: 2317.23 requests per second
+          avg       min       p50       p95       p99       max
+p50=0.095 p99=1.247
