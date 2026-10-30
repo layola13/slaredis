@@ -346,6 +346,40 @@ fn entry_clone(s: &Store, i: u64) -> Entry {
     return e;
 }
 
+// Decode the pack of entry i (a packed zset) into a fresh rows
+// vector: the pack is borrowed in place, the rows are built in a
+// local Vec<ZRow> and returned whole. This is the single zset
+// pack decode in the codebase (Form 3, Jev ruling
+// form3_single_attempt_then_def): entry_decode_pack installs its
+// result into the materialized entry with one assignment, and
+// commands.sla's pack_zrows delegates here for pack reads.
+fn store_pack_zrows(s: &Store, i: u64) -> Vec<ZRow> {
+    let rows: Vec<ZRow> = Vec::new();
+    let pk = &s.entries[i].pack;
+    let count: u64 = lp_count(pk);
+    let pos: u64 = 6;
+    let n: u64 = 0;
+    while n < count {
+        // member materialized only on the consuming path (see
+        // entry_decode_pack for the referee constraint)
+        let mpos: u64 = pos;
+        pos = lp_next(pk, pos);
+        let stext = lp_value_new(pk, pos);
+        pos = lp_next(pk, pos);
+        // zset payload is the score text written by fmt_f64;
+        // parse_f64_full accepts every form fmt_f64 emits (plain
+        // decimal, exponent, inf) -- an invariant the round-trip
+        // tests exercise, including extreme scores.
+        let (ok, sc) = parse_f64_full(&stext);
+        if ok {
+            let member = lp_value_new(pk, mpos);
+            rows.push(ZRow { member: member, score: sc });
+        };
+        n = n + 2;
+    }
+    return rows;
+}
+
 // Decode the pack of entry i into the payload vectors of the
 // owned entry `e` (same kind). The pack is cloned first so the
 // loops read a local while filling `e`.
@@ -381,30 +415,9 @@ fn entry_decode_pack(s: &Store, i: u64, e: Entry) -> Entry {
         }
         return e;
     };
-    let pos3: u64 = 6;
-    let n3: u64 = 0;
-    while n3 < count {
-        // The member bytes are materialized only on the path that
-        // consumes them: a loop-local value moved inside a nested
-        // branch makes the compiler emit its release at a merge
-        // where the register is out of scope (UnknownRegister in
-        // the SA referee), so the conditional shape is avoided
-        // entirely here.
-        let name_pos: u64 = pos3;
-        pos3 = lp_next(&pk, pos3);
-        let payload = lp_value_new(&pk, pos3);
-        pos3 = lp_next(&pk, pos3);
-        // zset payload is the score text written by fmt_f64;
-        // parse_f64_full accepts every form fmt_f64 emits (plain
-        // decimal, exponent, inf) -- an invariant the round-trip
-        // tests exercise, including extreme scores.
-        let (ok, sc) = parse_f64_full(&payload);
-        if ok {
-            let name = lp_value_new(&pk, name_pos);
-            e.zrows.push(ZRow { member: name, score: sc });
-        };
-        n3 = n3 + 2;
-    }
+    // zset: the rows are produced whole by store_pack_zrows (the
+    // pack_zrows shape) and installed with a single assignment.
+    e.zrows = store_pack_zrows(s, i);
     return e;
 }
 

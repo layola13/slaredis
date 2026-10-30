@@ -1184,28 +1184,11 @@ fn zrange_reply(rows: &Vec<ZRow>, order: &Vec<u64>, start: i64, stop: i64, withs
 }
 
 // Materialize a packed zset's rows (member + parsed score) into
-// a scratch vector, in pack (insertion) order.
+// a scratch vector, in pack (insertion) order. Delegates to
+// store_pack_zrows (store.sla): exactly one zset pack decode
+// exists in the codebase.
 fn pack_zrows(s: &Store, e: u64) -> Vec<ZRow> {
-    let rows: Vec<ZRow> = Vec::new();
-    let pk = &s.entries[e].pack;
-    let count: u64 = lp_count(pk);
-    let pos: u64 = 6;
-    let i: u64 = 0;
-    while i < count {
-        // member materialized only on the consuming path (see
-        // entry_decode_pack for the referee constraint)
-        let mpos: u64 = pos;
-        pos = lp_next(pk, pos);
-        let stext = lp_value_new(pk, pos);
-        pos = lp_next(pk, pos);
-        let (ok, sc) = parse_f64_full(&stext);
-        if ok {
-            let member = lp_value_new(pk, mpos);
-            rows.push(ZRow { member: member, score: sc });
-        };
-        i = i + 2;
-    }
-    return rows;
+    return store_pack_zrows(s, e);
 }
 
 fn cmd_zadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
