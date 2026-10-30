@@ -9,8 +9,7 @@
 //                       enabled at this path (max 255 bytes)
 //   SLAREDIS_AOF_FSYNC  always | everysec | no (default everysec;
 //                       see docs/PERSISTENCE.md for the rationale)
-//   SLAREDIS_LOOP_MODEL poll | goroutine (default poll until the
-//                       goroutine model's acceptance gates pass;
+//   SLAREDIS_LOOP_MODEL goroutine | poll (default goroutine;
 //                       see docs/GOROUTINE_DELIVERY.md). "poll"
 //                       is the original single-thread readiness
 //                       loop (server.sla); "goroutine" is the
@@ -99,7 +98,7 @@ fn main() -> i32 {
     // &(*p) bridge in this frame.
     let store = store_new();
     let model_env = env_value(STR_PTR("SLAREDIS_LOOP_MODEL"), STR_LEN("SLAREDIS_LOOP_MODEL"));
-    let goroutine_model: bool = false;
+    let goroutine_model: bool = true;
     if model_env.present {
         if bytes_eq_lit_ci(&model_env.value, STR_PTR("goroutine"), STR_LEN("goroutine")) {
             goroutine_model = true;

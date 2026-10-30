@@ -49,10 +49,29 @@ Configuration is environment-only:
 | `SLAREDIS_PASSWORD` | _(unset)_   | when set non-empty, connections must `AUTH`       |
 | `SLAREDIS_AOF_PATH` | _(unset)_   | when set non-empty, AOF persistence at this path  |
 | `SLAREDIS_AOF_FSYNC`| `everysec`  | `always` \| `everysec` \| `no` (see PERSISTENCE)  |
+| `SLAREDIS_LOOP_MODEL`| `goroutine` | `goroutine` \| `poll` -- concurrency model (see below) |
+| `SLAREDIS_YIELD_EVERY`| `128`      | goroutine model: manual yield cadence of its CPU loops, in commands (0 disables) |
 
 Exit codes: 64 invalid port, 65 invalid/over-long host,
 66 listen failure, 67 listener nonblocking setup failure,
-68 invalid persistence config, 69 AOF startup failure.
+68 invalid persistence config, 69 AOF startup failure,
+70 invalid `SLAREDIS_LOOP_MODEL`, 71 a core goroutine died
+under the supervisor (goroutine model only).
+
+## Concurrency models
+
+Two serving models are compiled in, selected by
+`SLAREDIS_LOOP_MODEL`:
+
+- `goroutine` (default): one goroutine per connection, a
+  single executor goroutine owning the store, dedicated AOF
+  writer and expiry sweeper goroutines, a supervisor, and
+  all socket IO concentrated in a driver on the main frame.
+  Design and measured rationale:
+  `docs/GOROUTINE_DELIVERY.md`; implementation:
+  `src/gserver.sla`.
+- `poll`: the original single-thread readiness loop
+  (`src/server.sla`), kept selectable as the rollback shape.
 
 ## Acceptance test
 
