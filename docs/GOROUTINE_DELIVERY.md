@@ -361,27 +361,39 @@ a quantified handoff term that belongs to the runtime's
 scheduler maturity (DEF line), not to command code.
 
 AOF fsync=always targeted comparison (redis-benchmark SET
--c 50 -n 10000 -d 3 -P 1; Redis `--appendonly yes
---appendfsync always`; two rounds each, same window):
-Redis 4660 / 4773 ops/s; slaredis goroutine 3958 / 4063
-ops/s; slaredis poll 3768 / 3643 ops/s. Near parity: at
--P 1 with 50 clients, both slaredis models amortize syncs
-across the concurrent batches about as well as Redis's
-group commit does, and the goroutine model is marginally
-ahead of poll (medians 4011 vs 3706, 1.08×) — its writer
-sync runs concurrently with the executor's next batch,
-where the poll model syncs inline in its round. All 10000
-records were verified present in both slaredis AOF files
-(450,000 bytes each) after the runs. (Two earlier fsync
-measurements disagreed with this set and each other —
-200 ops/s and 5143/3768 ops/s. The 200 ops/s window is
-discarded: it ran while another line's workload was
-saturating the host's disk, and it is not used anywhere in
-this record. The missing goroutine diagnostic rows in the
-bench script's own summary have a disclosed cause: an
-early fsync probe from this line shut the bench's Redis
-down on the shared port mid-run; the diagnostic numbers
-were re-measured separately, next paragraph.)
+-c 50 -P 1 -d 3; Redis `--appendonly yes --appendfsync
+always`). Three independent windows agree:
+
+| window | n | redis | goroutine | poll |
+| --- | --- | --- | --- | --- |
+| A | 20000 | 4990 | 204 | 182 |
+| B | 10000 | 4677 | 200 | 205 |
+| C | 10000 ×2 rounds | 5711 / 5546 | 215 / 220 | 233 / 230 |
+
+Both slaredis models sit at ≈200 ops/s — the host's
+serialized disk sync (~5 ms) is the whole story at -P 1:
+every batch waits out its own sync, neither model
+group-commits, and the model delta is noise (gor/poll
+0.94–1.12 across windows). Redis's ≈23× advantage here is
+its group commit. All records were verified present in
+the slaredis AOF files after every run (450,000 bytes at
+n=10000; 900,000 at n=20000).
+
+ERRATUM (2026-10-30, corrected after first push): the
+first-pushed version of this section reported
+3958/4063 (goroutine) and 3768/3643 (poll) ops/s and
+discarded the ≈200 ops/s readings as a contaminated
+window. That was a misreading of interleaved background
+outputs by this line: the ≈200 ops/s figures are the
+reproducible ones (three windows, above) and the
+thousands-class figures have no surviving raw output
+behind them. The correction is limited to this
+fsync=always comparison; no other number in this record
+is affected. (The missing goroutine diagnostic rows in
+the bench script's own summary have a disclosed cause:
+an early fsync probe from this line shut the bench's
+Redis down on the shared port mid-run; the diagnostic
+numbers were re-measured separately, next paragraph.)
 
 ## 7. Known limitations, stated plainly
 
