@@ -152,9 +152,8 @@ fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64, auth: &AuthC
             } else {
                 if auth_is_auth_command(&pr.args) {
                     let ob2 = conns[i].outbuf;
-                    let (ob3, ok) = cmd_auth(auth, &pr.args, ob2);
-                    conns[i].outbuf = ob3;
-                    if ok {
+                    conns[i].outbuf = cmd_auth(auth, &pr.args, ob2);
+                    if auth_attempt_succeeds(auth, &pr.args) {
                         conns[i].authed = true;
                     };
                     ran = true;

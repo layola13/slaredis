@@ -69,31 +69,54 @@ fn auth_is_default_user(a: &Vec<u8>) -> bool {
     return true;
 }
 
-// Execute AUTH. Returns (out, authenticated): the second element
-// is true only on a successful authentication.
-fn cmd_auth(cfg: &AuthConfig, args: &Vec<Vec<u8>>, out: Vec<u8>) -> (Vec<u8>, bool) {
+// True exactly when cmd_auth's reply to these args is the +OK
+// success: right arity, a password is configured, the username
+// (when given) is the default user, and the password matches.
+// Pure predicate over (cfg, args); cmd_auth below is the single
+// source of the reply bytes, this is the single source of the
+// success bit the server uses to mark the connection.
+//
+// The pair replaces a former (Vec<u8>, bool) tuple return from
+// cmd_auth: that heap-carrying tuple return -- the only one in
+// the server -- lost the connection's reply buffer at the
+// destructure site, so every AUTH command left its connection
+// permanently unanswered (server otherwise healthy). See the
+// E-fix evidence logs in chain-local/evidence/.
+fn auth_attempt_succeeds(cfg: &AuthConfig, args: &Vec<Vec<u8>>) -> bool {
     if len(args) < 2 || len(args) > 3 {
-        let o = auth_err_arity(out);
-        return (o, false);
+        return false;
     };
     if cfg.required != true {
-        if len(args) == 2 {
-            let o2 = resp_error(out, STR_PTR("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"), STR_LEN("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"));
-            return (o2, false);
-        };
-        let o3 = resp_error(out, STR_PTR("ERR AUTH <username> <password> called without any password configured for the default user. Are you sure your configuration is correct?"), STR_LEN("ERR AUTH <username> <password> called without any password configured for the default user. Are you sure your configuration is correct?"));
-        return (o3, false);
+        return false;
     };
     if len(args) == 3 {
         if auth_is_default_user(&args[1]) != true {
-            let o4 = auth_err_wrongpass(out);
-            return (o4, false);
+            return false;
+        };
+    };
+    return bytes_eq(&args[len(args) - 1], &cfg.password);
+}
+
+// Execute AUTH: render the reply for these args onto `out`.
+// Whether the attempt authenticated the connection is decided
+// by auth_attempt_succeeds above, not by this function's return.
+fn cmd_auth(cfg: &AuthConfig, args: &Vec<Vec<u8>>, out: Vec<u8>) -> Vec<u8> {
+    if len(args) < 2 || len(args) > 3 {
+        return auth_err_arity(out);
+    };
+    if cfg.required != true {
+        if len(args) == 2 {
+            return resp_error(out, STR_PTR("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"), STR_LEN("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"));
+        };
+        return resp_error(out, STR_PTR("ERR AUTH <username> <password> called without any password configured for the default user. Are you sure your configuration is correct?"), STR_LEN("ERR AUTH <username> <password> called without any password configured for the default user. Are you sure your configuration is correct?"));
+    };
+    if len(args) == 3 {
+        if auth_is_default_user(&args[1]) != true {
+            return auth_err_wrongpass(out);
         };
     };
     if bytes_eq(&args[len(args) - 1], &cfg.password) {
-        let o5 = resp_simple(out, STR_PTR("OK"), STR_LEN("OK"));
-        return (o5, true);
+        return resp_simple(out, STR_PTR("OK"), STR_LEN("OK"));
     };
-    let o6 = auth_err_wrongpass(out);
-    return (o6, false);
+    return auth_err_wrongpass(out);
 }
