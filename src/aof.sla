@@ -238,15 +238,13 @@ fn aof_append(st: &AofState, rec: &Vec<u8>, now_ms: i64) -> bool {
     return aof_flush_pending(st, now_ms);
 }
 
-// Periodic loop tick (called next to the expiry sweep): the
-// everysec fsync, and the automatic rewrite check.
-fn aof_tick(st: &AofState, s: &Store, now_ms: i64) {
-    if st.enabled != true {
-        return;
-    };
-    if st.broken {
-        return;
-    };
+// The everysec fsync half of the loop tick, extracted so the
+// goroutine AOF writer (gserver.sla) drives the identical policy
+// from its own tick: sync when unsynced bytes are at least one
+// second old. Returns false exactly when a sync was attempted
+// and failed (the state is marked broken in that case); true
+// when no sync was due or the sync succeeded.
+fn aof_tick_sync(st: &AofState, now_ms: i64) -> bool {
     if st.fsync_mode == AOF_FSYNC_EVERYSEC {
         if st.unsynced > 0 {
             if now_ms - st.last_sync_ms >= 1000 {
@@ -256,10 +254,25 @@ fn aof_tick(st: &AofState, s: &Store, now_ms: i64) {
                     st.last_sync_ms = now_ms;
                 } else {
                     st.broken = true;
-                    return;
+                    return false;
                 };
             };
         };
+    };
+    return true;
+}
+
+// Periodic loop tick (called next to the expiry sweep): the
+// everysec fsync, and the automatic rewrite check.
+fn aof_tick(st: &AofState, s: &Store, now_ms: i64) {
+    if st.enabled != true {
+        return;
+    };
+    if st.broken {
+        return;
+    };
+    if aof_tick_sync(st, now_ms) != true {
+        return;
     };
     if st.size >= st.base_size + AOF_REWRITE_MIN_GROWTH {
         if st.size >= st.base_size * 2 {
@@ -388,6 +401,24 @@ fn aof_rewrite(st: &AofState, s: &Store, now_ms: i64) -> bool {
         return false;
     };
     let data = dataset_serialize(s, now_ms, Vec::new());
+    return aof_swap_in(st, &data, now_ms);
+}
+
+// Install a serialized dataset as the live AOF: write it to
+// <path>.rewrite.tmp, fsync the temp file, close the live
+// handle, rename the temp file over the live path, reopen the
+// append handle, and adopt the payload length as size and
+// rewrite baseline. Extracted from aof_rewrite so the goroutine
+// AOF writer (gserver.sla) installs executor-serialized
+// datasets through the identical sequence. The caller owns the
+// ordering contract: every journal record the snapshot reflects
+// must already be durable in the live file (aof_rewrite flushes
+// its staged records first; the goroutine writer's append ops
+// are FIFO-ordered ahead of the install op), and no record the
+// snapshot does NOT reflect may land in the old file after this
+// point. On rename failure the append handle is restored on the
+// pre-rewrite file; on reopen failure the state is broken.
+fn aof_swap_in(st: &AofState, data: &Vec<u8>, now_ms: i64) -> bool {
     let tmp = bytes_clone(&st.path);
     let tmp2 = bytes_push_lit(tmp, STR_PTR(".rewrite.tmp"), STR_LEN(".rewrite.tmp"));
     // write + sync the temp file
@@ -403,7 +434,7 @@ fn aof_rewrite(st: &AofState, s: &Store, now_ms: i64) -> bool {
     if ost != SA_STD_OK {
         return false;
     };
-    if aof_write_all(h, &data) != true {
+    if aof_write_all(h, data) != true {
         let cc = sa_fs_file_close(h);
         let rr = aof_remove_file(&tmp2);
         return false;

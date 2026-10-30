@@ -9,20 +9,35 @@
 //                       enabled at this path (max 255 bytes)
 //   SLAREDIS_AOF_FSYNC  always | everysec | no (default everysec;
 //                       see docs/PERSISTENCE.md for the rationale)
+//   SLAREDIS_LOOP_MODEL poll | goroutine (default poll until the
+//                       goroutine model's acceptance gates pass;
+//                       see docs/GOROUTINE_DELIVERY.md). "poll"
+//                       is the original single-thread readiness
+//                       loop (server.sla); "goroutine" is the
+//                       per-connection goroutine model
+//                       (gserver.sla).
+//   SLAREDIS_YIELD_EVERY  goroutine model only: manual
+//                       sa_task_yield cadence for its CPU loops
+//                       (default 128 commands; 0 disables -- a
+//                       bench position, see the delivery doc).
 // Exit codes: 0 never returns (server loop); 64 invalid
 // SLAREDIS_PORT; 65 invalid SLAREDIS_HOST; 66 listen failed;
 // 67 listener setup failed; 68 invalid persistence config;
-// 69 AOF startup failure (replay or open).
+// 69 AOF startup failure (replay or open); 70 invalid
+// SLAREDIS_LOOP_MODEL; 71 a core goroutine died under the
+// supervisor (goroutine model only).
 @import "sa_std/env.sai"
 @import "sa_std/vec.sa"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "sa_std/core/slice.sa"
+@import "sa_std/core/box.sa"
 @import "bytes.sla"
 @import "store.sla"
 @import "auth.sla"
 @import "aof.sla"
 @import "server.sla"
+@import "gserver.sla"
 
 struct EnvValue { present: bool, value: Vec<u8> }
 
@@ -75,8 +90,32 @@ fn main() -> i32 {
     if aof_status != 0 {
         return aof_status;
     };
+    // The store starts as a plain value. The goroutine model
+    // takes it by value (its executor owns it as a value field
+    // of its state block -- see gserver.sla's ExecSt note on
+    // why borrows of an already-boxed value struct are not
+    // used there); the poll model keeps its historical shape
+    // and gets the store boxed, borrowed back through the
+    // &(*p) bridge in this frame.
     let store = store_new();
-    return run_server(&store, host, port, auth_cfg, aof_cfg);
+    let model_env = env_value(STR_PTR("SLAREDIS_LOOP_MODEL"), STR_LEN("SLAREDIS_LOOP_MODEL"));
+    let goroutine_model: bool = false;
+    if model_env.present {
+        if bytes_eq_lit_ci(&model_env.value, STR_PTR("goroutine"), STR_LEN("goroutine")) {
+            goroutine_model = true;
+        } else {
+            if bytes_eq_lit_ci(&model_env.value, STR_PTR("poll"), STR_LEN("poll")) {
+                goroutine_model = false;
+            } else {
+                return 70;
+            };
+        };
+    };
+    if goroutine_model {
+        return run_server_goroutine(store, host, port, auth_cfg, aof_cfg);
+    };
+    let store_box = Box::into_raw(Box::new(store));
+    return run_server(&(*store_box), host, port, auth_cfg, aof_cfg);
 }
 
 // The env-value moves below happen only on return paths: moving

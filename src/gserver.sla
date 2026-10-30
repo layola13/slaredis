@@ -1,0 +1,1534 @@
+// gserver.sla -- the goroutine concurrency model, selected by
+// SLAREDIS_LOOP_MODEL=goroutine (see main.sla); the poll model
+// in server.sla remains selectable as the rollback shape
+// (PLAN-GOROUTINE section 5.4).
+//
+// Shape (PLAN-GOROUTINE sections 2-3, Jev ruling
+// executor_goroutine 0.97): one goroutine per connection; a
+// single executor goroutine owns the store and runs every
+// command batch it receives over one FIFO channel; a
+// dedicated AOF writer goroutine owns the AofState; a
+// dedicated sweeper goroutine posts expiry sweeps to the
+// executor; a supervisor goroutine watches all of them. All
+// socket IO is concentrated in one driver, which runs on the
+// main goroutine's frame (see the IoSt comment for why), and
+// hands bytes to and from the connection goroutines over
+// channels; a loopback wake socket lets producers pull the
+// driver out of its readiness wait immediately.
+//
+// Why not the poll shape: the poll loop's connection table
+// forced every connection's buffers through one shared Vec,
+// and its periodic reap rebuilt that table by moving live
+// connections' state -- the shape behind the
+// >=1000-connection bulk-close crash (delivery record,
+// face 4). Here a connection's state lives in its own heap
+// job block, its lifetime is its goroutine's lifetime, and
+// retirement is a pointer swap in the driver's slot table
+// plus a monitor message: no connection's bytes are ever
+// rebuilt because another connection ended. There is no
+// reap path at all. Blocking commands are plain sequential
+// code inside a connection goroutine; no readiness
+// bookkeeping exists outside the driver.
+//
+// Redis serial semantics are preserved by construction:
+// every store access runs on the single executor, which
+// takes batches from one FIFO channel, so commands execute
+// atomically one at a time in a definable global order (the
+// executor's receive order). Replies for a batch are
+// produced in batch order and the connection goroutine
+// appends them to its out buffer in that order, interleaved
+// correctly with its locally handled AUTH traffic (a pending
+// batch is always flushed before a local AUTH step runs).
+//
+// Ownership and lifetime rules (all shapes probe-verified
+// against the master toolchain; see
+// docs/GOROUTINE_DELIVERY.md for the full defect register):
+//   - Cross-goroutine sharing goes through Box'd heap blocks
+//     whose pointers travel over channels; fields are read
+//     and written through the pointer directly. Borrows
+//     never cross a spawn (the checker rejects them).
+//   - A &(*p) borrow of a boxed VALUE struct is not a borrow
+//     of the heap object on this toolchain: scalar fields
+//     read wrong and callee writes land elsewhere (measured
+//     on AuthConfig and AofState). The sound form, used
+//     everywhere here, is an OWNED VALUE FIELD inside a heap
+//     block, borrowed in place: &(*job).auth_cfg,
+//     &(*job).wst, &(*st).store. Frame locals of a goroutine
+//     (values and borrows alike) are likewise not trusted
+//     across a park: all cross-cycle state lives in the job
+//     blocks, re-derived from the job pointer at each use.
+//   - Binding a Vec field of a heap struct with `let x =
+//     (*p).field` MOVES it out (that is the codebase take
+//     idiom); on shared structs it must be read in place
+//     element-wise instead (measured: a cloned password was
+//     drained by the first connection's clone).
+//   - CmdReq blocks are per-sender and reused: a connection
+//     owns exactly one, has at most one batch outstanding,
+//     and reuses the block for its whole lifetime.
+//   - AofOp blocks come from an executor-owned pool of 8; the
+//     writer returns each op on the recycle channel when
+//     done.
+//   - A connection's CmdReq/ConnJob blocks are retained for
+//     the process lifetime (two small blocks per connection
+//     ever served). Documented here rather than hidden: the
+//     connection goroutine cannot free its own job block,
+//     and no verified free-handoff shape exists yet.
+//   - Hot tables (driver slots, supervisor monitors) are
+//     fixed slot arrays with index assignment, never Vec
+//     fields pushed from a loop (measured defect, probes
+//     18f/18h in the delivery record).
+//   - CHANNEL-OP DISCIPLINE (measured, probes 27/28/30/31):
+//     a channel operation (send / recv / select) written
+//     textually inside a never-returning loop body leaks
+//     fixed-stack space on EVERY iteration -- a plain recv
+//     in a loop body overflows the 256 KiB goroutine stack
+//     within thousands of iterations; a select leaks in
+//     proportion to its arm count. The same operations
+//     inside a CALLED function rewind on return (300k calls
+//     measured clean). Therefore every long-lived goroutine
+//     in this module is a thin loop whose body is a single
+//     call to a step function that performs the cycle's
+//     channel work and returns.
+//
+// Yield discipline (the compiler inserts no yield points):
+// every CPU loop this module owns -- the executor's batch
+// walk and the connection parse walk -- calls
+// sa_task_yield() every yield_every commands
+// (SLAREDIS_YIELD_EVERY, default 128; 0 disables). Loops
+// that block on channels park through the runtime and need
+// no manual yield.
+//
+// Supervision (PLAN-GOROUTINE section 3.6): the supervisor
+// monitors the executor, the writer, the sweeper, and every
+// connection goroutine. A connection exit with a non-zero
+// code closes only that connection (the supervisor asks the
+// driver to close the stream; the trap is counted). The
+// sweeper is respawned on exit. The executor and the AOF
+// writer are single points by design: if either exits, for
+// any reason, the supervisor raises ctx.core_dead and the
+// driver returns exit code 71 -- a loud process failure
+// recovered by AOF replay on restart, never a silent solo
+// restart that would serve a half-owned dataset.
+@import "sa_std/net.sai"
+@import "sa_std/net.sla"
+@import "sa_std/time.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/status.sla"
+@import "sa_std/vec.sa"
+@import "sa_std/ptr.sa"
+@import "sa_std/string.sa"
+@import "sa_std/task.sai"
+@import "sa_std/core/box.sa"
+@import "sa_std/core/slice.sa"
+@import "bytes.sla"
+@import "store.sla"
+@import "resp.sla"
+@import "commands.sla"
+@import "auth.sla"
+@import "journal.sla"
+@import "aof.sla"
+
+const CMD_BATCH: u8 = 0;
+const CMD_SWEEP: u8 = 1;
+const CMD_SERIALIZE: u8 = 2;
+
+const AOF_OP_APPEND: u8 = 0;
+const AOF_OP_INSTALL: u8 = 1;
+
+const IO_OUT_BYTES: u8 = 0;
+const IO_OUT_CLOSE_AFTER_FLUSH: u8 = 1;
+const IO_OUT_CLOSE_NOW: u8 = 2;
+
+// Exit code when a core goroutine (executor / AOF writer /
+// listener) dies under the supervisor; see the header comment.
+const G_EXIT_CORE_DEAD: i32 = 71;
+
+struct SrvCtx {
+    auth: *AuthConfig,
+    aof_enabled: bool,
+    aof_fsync: u8,
+    cmd_chan: Chan<*CmdReq>,
+    aof_chan: Chan<*AofOp>,
+    aof_recycle: Chan<*AofOp>,
+    sup_reg: Chan<(u64, u64)>,
+    // Connection goroutines hand reply bytes and close
+    // requests to the IO driver on this channel, then poke the
+    // driver's wake socket (wake_tx) so its poll wakes at once.
+    io_out: Chan<*IoOut>,
+    wake_tx: u64,
+    // Set by the supervisor goroutine when a core goroutine
+    // (executor / AOF writer) dies; the IO driver runs on the
+    // main goroutine's frame and checks this once per round,
+    // then returns G_EXIT_CORE_DEAD. (A plain bool written by
+    // one goroutine and read by another; the scheduler's
+    // park/wake edges order the accesses in practice, the
+    // same assumption the sticky aof_broken flag relies on.)
+    core_dead: bool,
+    // Sticky failure flag: written only by the AOF writer
+    // goroutine (the AofState owner), read by the executor at
+    // batch boundaries. Monotonic (false -> true only), so the
+    // unsynchronized read can lag a batch but never invent a
+    // recovery that did not happen; under fsync=always the
+    // executor additionally learns failures synchronously from
+    // the op result it waits for.
+    aof_broken: bool,
+    yield_every: u64,
+}
+
+struct CmdReq {
+    kind: u8,
+    // true: the sender blocks on done (connection batches).
+    // false: completion is signalled best-effort (sweeper and
+    // writer requests; nobody waits, so the signal must never
+    // block the executor).
+    ack: bool,
+    batch: Vec<Vec<Vec<u8>>>,
+    replies: Vec<Vec<u8>>,
+    done: Chan<u64>,
+}
+
+struct AofOp {
+    kind: u8,
+    idx: u64,
+    chunks: Vec<Vec<u8>>,
+    data: Vec<u8>,
+    result: bool,
+}
+
+// IO driver -> connection goroutine: one read chunk (up to
+// 4 KiB) or the end-of-stream marker.
+struct IoMsg {
+    bytes: Vec<u8>,
+    eof: bool,
+}
+
+// Connection goroutine -> IO driver, on the shared io_out
+// channel: reply bytes to append to the connection's out
+// queue, or a close request (IO_OUT_CLOSE_AFTER_FLUSH: close
+// once the queue has drained; IO_OUT_CLOSE_NOW: close at
+// once, used by the supervisor for trapped connections).
+struct IoOut {
+    fd: u64,
+    kind: u8,
+    bytes: Vec<u8>,
+}
+
+struct ConnJob {
+    ctx: *SrvCtx,
+    // This connection's own copy of the auth config (cloned
+    // by the IO driver at accept time). It must be an owned
+    // field, not a borrow of the shared config: &(*p) on an
+    // already-boxed value struct yields a borrow of a shallow
+    // temporary on this toolchain (measured: the scalar
+    // `required` and the password header read back wrong
+    // inside connection goroutines, silently disabling AUTH;
+    // delivery record), while a borrow of a heap-resident
+    // field -- &(*job).auth_cfg, the same shape as the
+    // resp_parse borrow of inbuf -- is sound.
+    auth_cfg: AuthConfig,
+    stream: u64,
+    req: *CmdReq,
+    inbox: Chan<*IoMsg>,
+    // The whole per-connection state lives in this heap block,
+    // not in the goroutine's frame: frame values held across a
+    // park (chan send/recv, net wait) are not reliable in this
+    // toolchain (measured: after the first dispatch cycle a
+    // connection's frame Vec headers read back corrupted --
+    // stale-buffer replays and zeroed reply buffers). Heap
+    // fields accessed through the job pointer are the shape
+    // every working goroutine program in this stack uses.
+    inbuf: Vec<u8>,
+    inoff: u64,
+    outbuf: Vec<u8>,
+    authed: bool,
+    close_after_flush: bool,
+    yield_ct: u64,
+    auth_ok_pending: bool,
+}
+
+struct ExecJob {
+    ctx: *SrvCtx,
+    store: Store,
+}
+
+struct AofJob {
+    ctx: *SrvCtx,
+    // The AOF state as an owned value field (see the
+    // ConnJob.auth_cfg comment: borrows of an already-boxed
+    // value struct, &(*p), are unreliable in goroutine code on
+    // this toolchain -- the writer's flush silently operated
+    // on a phantom copy and the file stayed empty -- while a
+    // borrow of a heap-resident field is sound). The writer
+    // goroutine is the state's only owner.
+    wst: AofState,
+    sreq: *CmdReq,
+    rw_out: bool,
+}
+
+struct SweepJob {
+    ctx: *SrvCtx,
+    req: *CmdReq,
+}
+
+struct IoJob {
+    ctx: *SrvCtx,
+    listener: u64,
+    wake_rx: u64,
+}
+
+// The IO driver's per-connection socket state. The table holds
+// pointers only, so retiring a connection never moves another
+// connection's data (the face-4 lesson); the byte queue lives
+// in the heap block.
+struct DriverConn {
+    fd: u64,
+    inbox: Chan<*IoMsg>,
+    outq: Vec<u8>,
+    out_off: u64,
+    ready: u32,
+    read_closed: bool,
+    eof_sent: bool,
+    close_after_flush: bool,
+    dead: bool,
+}
+
+// Supervisor state (heap block, like every other goroutine's:
+// the registration vectors are read and mutated across the
+// registration channel's parks on every iteration).
+struct SupJob {
+    ctx: *SrvCtx,
+    m_exec: Chan<(u64, i32)>,
+    m_aof: Chan<(u64, i32)>,
+    m_sweep: Chan<(u64, i32)>,
+}
+
+struct SupSt {
+    // Slot arrays, not Vecs: the supervisor is a goroutine,
+    // and pushing into a Vec field of a heap struct from a
+    // goroutine loop is the measured defect behind probes
+    // 18f/18h (see the IoSt comment). Slot 0 is a
+    // permanent sentinel (a dummy monitor channel that
+    // never delivers); live entries are [1, n); removal
+    // swaps the last entry down.
+    mons: [Chan<(u64, i32)>; 8192],
+    mstreams: [u64; 8192],
+    n: u64,
+    scan_i: u64,
+    conn_traps: u64,
+    sweep_restarts: u64,
+}
+
+// Executor-local state (Box'd once at executor entry; helpers
+// take the pointer so the op pool can be mutated in place).
+struct ExecSt {
+    ctx: *SrvCtx,
+    // The store as an owned value field: the executor is its
+    // only owner, and command execution borrows this field
+    // (&(*st).store -- the sound heap-field borrow) instead of
+    // a &(*p) bridge over an externally boxed store (the
+    // unreliable form; see AofJob.wst).
+    store: Store,
+    free_ops: Vec<*AofOp>,
+    broken: bool,
+    since_yield: u64,
+    // The batch being executed and its staged journal records:
+    // heap-side because g_aof_append / g_aof_install park this
+    // goroutine mid-batch (see ConnJob's note on frame values).
+    cur_batch: Vec<Vec<Vec<u8>>>,
+    cur_chunks: Vec<Vec<u8>>,
+}
+
+fn g_signal(req: *CmdReq) {
+    if (*req).ack {
+        (*req).done.send(1);
+    } else {
+        select {
+            case (*req).done.send(1) {
+            }
+            default {
+            }
+        }
+    };
+}
+
+// ---- AOF op pool (executor side) ----
+
+fn g_op_drain(st: *ExecSt) {
+    let draining: bool = true;
+    while draining {
+        select {
+            case let op = (*(*st).ctx).aof_recycle.recv() {
+                (*st).free_ops.push(op);
+            }
+            default {
+                draining = false;
+            }
+        }
+    }
+}
+
+fn g_op_take(st: *ExecSt) -> *AofOp {
+    g_op_drain(st);
+    while len((*st).free_ops) == 0 {
+        let (op2, cl2) = (*(*st).ctx).aof_recycle.recv();
+        (*st).free_ops.push(op2);
+        g_op_drain(st);
+    }
+    let n: u64 = len((*st).free_ops);
+    let op = (*st).free_ops[n - 1];
+    // Vec has no pop in this stack: rebuild without the tail.
+    let nf: Vec<*AofOp> = Vec::new();
+    let i: u64 = 0;
+    while i + 1 < n {
+        nf.push((*st).free_ops[i]);
+        i = i + 1;
+    }
+    (*st).free_ops = nf;
+    return op;
+}
+
+// Wait until the writer recycles this exact op; returns its
+// result. Recycles of other ops go back to the free list.
+fn g_op_wait(st: *ExecSt, mine: *AofOp) -> bool {
+    let waiting: bool = true;
+    let res: bool = false;
+    while waiting {
+        let (op, cl) = (*(*st).ctx).aof_recycle.recv();
+        if (*op).idx == (*mine).idx {
+            res = (*op).result;
+            (*st).free_ops.push(op);
+            waiting = false;
+        } else {
+            (*st).free_ops.push(op);
+        };
+    }
+    return res;
+}
+
+// Dispatch one append op carrying a batch's staged journal
+// records. Under fsync=always the caller waits for the recycle
+// (the records are synced before the batch's replies are
+// released, the same durability point the poll loop's inline
+// flush produced); other modes are fire-and-forget and learn
+// about failures from the writer's sticky flag.
+fn g_aof_append(st: *ExecSt, chunks: Vec<Vec<u8>>) -> bool {
+    let ctx = (*st).ctx;
+    let op = g_op_take(st);
+    (*op).kind = AOF_OP_APPEND;
+    (*op).chunks = chunks;
+    (*op).data = Vec::new();
+    (*op).result = false;
+    (*ctx).aof_chan.send(op);
+    if (*ctx).aof_fsync == AOF_FSYNC_ALWAYS {
+        let ok = g_op_wait(st, op);
+        if ok != true {
+            (*st).broken = true;
+        };
+        return ok;
+    };
+    return true;
+}
+
+// Dispatch one install op carrying a serialized dataset. The
+// manual BGREWRITEAOF path waits (the poll loop's rewrite was
+// synchronous and its reply reports the outcome); the
+// writer-requested auto-rewrite install is fire-and-forget.
+fn g_aof_install(st: *ExecSt, data: Vec<u8>, wait: bool) -> bool {
+    let ctx = (*st).ctx;
+    let op = g_op_take(st);
+    (*op).kind = AOF_OP_INSTALL;
+    (*op).chunks = Vec::new();
+    (*op).data = data;
+    (*op).result = false;
+    (*ctx).aof_chan.send(op);
+    if wait {
+        return g_op_wait(st, op);
+    };
+    return true;
+}
+
+// Deep-copy one parsed command's argument vector. The batch
+// must own its arguments outright: pr.args is a field of the
+// ParseResult value resp_parse returned, and moving that field
+// into the batch leaves the buffer double-owned -- the
+// parser value's later drop frees arguments the executor is
+// still reading (measured: second-command replies containing
+// heap debris and "unknown command" fragments). The poll loop
+// never moves pr.args (it borrows in place); the clone is the
+// goroutine model's equivalent ownership transfer.
+fn g_clone_args(args: &Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let out: Vec<Vec<u8>> = Vec::new();
+    let i: u64 = 0;
+    while i < len(args) {
+        out.push(bytes_clone(&args[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---- connection goroutine ----
+
+// Send the connection's pending batch to the executor, wait
+// for completion, and append the replies to its out buffer in
+// order. The batch/reply vectors are reset for the next pass.
+fn g_flush_batch(job: *ConnJob) {
+    let ctx = (*job).ctx;
+    let req = (*job).req;
+    if len((*req).batch) == 0 {
+        return;
+    };
+    (*req).kind = CMD_BATCH;
+    (*req).ack = true;
+    (*ctx).cmd_chan.send(req);
+    let (dv, dcl) = (*req).done.recv();
+    let ri: u64 = 0;
+    while ri < len((*req).replies) {
+        let ob = (*job).outbuf;
+        (*job).outbuf = bytes_push_range(ob, &(*req).replies[ri], 0, len((*req).replies[ri]));
+        ri = ri + 1;
+    }
+    (*req).batch = Vec::new();
+    (*req).replies = Vec::new();
+}
+
+// Poke the IO driver's wake socket: one byte on a loopback
+// self-connection whose read end sits in the driver's poll
+// set, so a poll that would otherwise sleep is interrupted
+// the moment reply bytes or a close request are queued. The
+// socket is nonblocking; a failed poke only means a wakeup is
+// already pending, never a lost one (the queued channel
+// message is drained on the next round regardless).
+fn g_poke(ctx: *SrvCtx) {
+    let one: [u8; 1] = [1u8; 1];
+    let op: ptr = PTR_BYTE_ADD(&one, 0);
+    let written: u64 = 0;
+    let st: i32 = sa_std_net_tcp_stream_write((*ctx).wake_tx, op, 1, &written);
+}
+
+// Hand the connection's accumulated reply bytes to the IO
+// driver (and wake it). Order on the io_out channel is the
+// wire order: bytes always precede a close request sent later.
+fn g_emit(job: *ConnJob) {
+    if len((*job).outbuf) == 0 {
+        return;
+    };
+    let bytes = (*job).outbuf;
+    (*job).outbuf = Vec::new();
+    let m = Box::into_raw(Box::new(IoOut { fd: (*job).stream, kind: IO_OUT_BYTES, bytes: bytes }));
+    (*(*job).ctx).io_out.send(m);
+    g_poke((*job).ctx);
+}
+
+fn g_close_ctl(job: *ConnJob, kind: u8) {
+    let m = Box::into_raw(Box::new(IoOut { fd: (*job).stream, kind: kind, bytes: Vec::new() }));
+    (*(*job).ctx).io_out.send(m);
+    g_poke((*job).ctx);
+}
+
+fn g_conn_main(job: *ConnJob) {
+    // Cross-park state lives in the job block, not in frame
+    // locals (the heap discipline in the header comment); the
+    // auth config is the job's own copy (see ConnJob.auth_cfg).
+    // The loop body only calls g_conn_step: channel operations
+    // inside a never-returning loop body leak fixed-stack per
+    // iteration on this toolchain (measured, probes 30/31 in
+    // the delivery record), so every goroutine's cycle lives
+    // in a called function whose frame rewinds on return.
+    (*job).authed = (*job).auth_cfg.required != true;
+    let alive: bool = true;
+    while alive {
+        alive = g_conn_step(job);
+    }
+}
+
+// One connection cycle: wait for one inbox message (a data
+// chunk or the end-of-stream marker), run the exec pass over
+// everything buffered, flush, emit. Returns false when the
+// connection is finished (protocol-error close or the final
+// pass after end-of-stream).
+fn g_conn_step(job: *ConnJob) -> bool {
+        let (msg, mcl) = (*job).inbox.recv();
+        let is_eof: bool = (*msg).eof;
+        if is_eof != true {
+            let mb = (*msg).bytes;
+            let bi2: u64 = 0;
+            while bi2 < len(mb) {
+                (*job).inbuf.push(mb[bi2]);
+                bi2 = bi2 + 1;
+            }
+        };
+        // Exec pass over everything buffered (also the final
+        // pass on the end-of-stream marker: complete buffered
+        // commands still run, exactly as the poll loop executed
+        // them on the round that reported the hangup). The AUTH
+        // gate and AUTH itself are handled locally, in order; a
+        // pending store batch is flushed before either, so
+        // reply order matches the poll loop's single out buffer
+        // exactly. The AUTH reply and its success bit are
+        // computed BEFORE the flush: the flush parks this
+        // goroutine, and the parse result (a frame value) is
+        // not read after any park.
+        while (*job).inoff < len((*job).inbuf) {
+            let pr = resp_parse(&(*job).inbuf, (*job).inoff);
+            if pr.state == PARSE_INCOMPLETE {
+                break;
+            };
+            if pr.state == PARSE_ERROR {
+                // Replies of commands executed before the bad
+                // bytes precede the error, as in the poll loop.
+                g_flush_batch(job);
+                let obe = (*job).outbuf;
+                (*job).outbuf = resp_error(obe, STR_PTR("ERR Protocol error"), STR_LEN("ERR Protocol error"));
+                (*job).close_after_flush = true;
+                (*job).inoff = len((*job).inbuf);
+                break;
+            };
+            (*job).inoff = (*job).inoff + pr.consumed;
+            if pr.state == PARSE_OK {
+                if auth_gate_allows(&(*job).auth_cfg, (*job).authed, &pr.args) != true {
+                    g_flush_batch(job);
+                    let obn = (*job).outbuf;
+                    (*job).outbuf = resp_error(obn, STR_PTR("NOAUTH Authentication required."), STR_LEN("NOAUTH Authentication required."));
+                } else {
+                    if auth_is_auth_command(&pr.args) {
+                        let arep = cmd_auth(&(*job).auth_cfg, &pr.args, Vec::new());
+                        (*job).auth_ok_pending = auth_attempt_succeeds(&(*job).auth_cfg, &pr.args);
+                        g_flush_batch(job);
+                        let ob2 = (*job).outbuf;
+                        (*job).outbuf = bytes_push_range(ob2, &arep, 0, len(arep));
+                        if (*job).auth_ok_pending {
+                            (*job).authed = true;
+                            (*job).auth_ok_pending = false;
+                        };
+                    } else {
+                        (*(*job).req).batch.push(g_clone_args(&pr.args));
+                    };
+                };
+                let ye = (*(*job).ctx).yield_every;
+                if ye > 0 {
+                    (*job).yield_ct = (*job).yield_ct + 1;
+                    if (*job).yield_ct >= ye {
+                        let yst: i32 = sa_task_yield();
+                        (*job).yield_ct = 0;
+                    };
+                };
+            };
+        }
+        g_flush_batch(job);
+        // compact the input buffer (same rules as the poll loop)
+        if (*job).inoff == len((*job).inbuf) {
+            (*job).inbuf = Vec::new();
+            (*job).inoff = 0;
+        } else {
+            if (*job).inoff >= 8192 {
+                let rest: Vec<u8> = Vec::new();
+                let rest2 = bytes_push_range(rest, &(*job).inbuf, (*job).inoff, len((*job).inbuf));
+                (*job).inbuf = rest2;
+                (*job).inoff = 0;
+            };
+        };
+        g_emit(job);
+        if (*job).close_after_flush {
+            g_close_ctl(job, IO_OUT_CLOSE_AFTER_FLUSH);
+            return false;
+        };
+        if is_eof {
+            g_close_ctl(job, IO_OUT_CLOSE_AFTER_FLUSH);
+            return false;
+        };
+        return true;
+}
+
+// ---- executor goroutine ----
+
+// Run one connection batch against the store. Mirrors the
+// poll loop's conn_exec_all decision chain minus the AUTH steps
+// (those never leave the connection goroutine): BGREWRITEAOF,
+// the broken-AOF write refusal, normal dispatch, and the
+// journal hook -- with records staged per batch and dispatched
+// to the AOF writer once, before the batch is signalled done,
+// so a reply never precedes its record's handoff.
+fn g_exec_batch(st: *ExecSt, req: *CmdReq) {
+    let ctx = (*st).ctx;
+    if (*ctx).aof_broken {
+        (*st).broken = true;
+    };
+    let now_ms: i64 = sa_time_unix_ms();
+    (*req).replies = Vec::new();
+    (*st).cur_chunks = Vec::new();
+    // The batch vector moves out of the request block into the
+    // executor state block; the sender reinitializes it after
+    // the done signal.
+    (*st).cur_batch = (*req).batch;
+    let bi: u64 = 0;
+    while bi < len((*st).cur_batch) {
+        if aof_is_rewrite_command(&(*st).cur_batch[bi]) {
+            if len((*st).cur_batch[bi]) != 1 {
+                (*req).replies.push(err_arity(Vec::new(), STR_PTR("bgrewriteaof"), STR_LEN("bgrewriteaof")));
+            } else {
+                if (*ctx).aof_enabled != true {
+                    (*req).replies.push(resp_error(Vec::new(), STR_PTR("ERR BGREWRITEAOF requires AOF persistence to be enabled"), STR_LEN("ERR BGREWRITEAOF requires AOF persistence to be enabled")));
+                } else {
+                    // This batch's earlier records belong to the
+                    // pre-rewrite file: the append op is FIFO-
+                    // ordered ahead of the install op, so the
+                    // writer lands them before the rename (the
+                    // poll loop flushed its staged records
+                    // inside aof_rewrite before serializing).
+                    if len((*st).cur_chunks) > 0 {
+                        let chc = (*st).cur_chunks;
+                        (*st).cur_chunks = Vec::new();
+                        let okc = g_aof_append(st, chc);
+                    };
+                    let data = dataset_serialize(&(*st).store, now_ms, Vec::new());
+                    if g_aof_install(st, data, true) {
+                        (*req).replies.push(resp_simple(Vec::new(), STR_PTR("AOF rewrite completed"), STR_LEN("AOF rewrite completed")));
+                    } else {
+                        (*req).replies.push(resp_error(Vec::new(), STR_PTR("ERR AOF rewrite failed"), STR_LEN("ERR AOF rewrite failed")));
+                    };
+                };
+            };
+        } else {
+            // Write classification once per command, as in the
+            // poll loop (F-perf-4 rationale there applies here).
+            let is_write: bool = false;
+            if (*ctx).aof_enabled {
+                is_write = journal_is_write(&(*st).cur_batch[bi]);
+            };
+            if is_write && (*st).broken {
+                (*req).replies.push(resp_error(Vec::new(), STR_PTR("ERR AOF write failed: persistence is broken, writes are refused"), STR_LEN("ERR AOF write failed: persistence is broken, writes are refused")));
+            } else {
+                let rep = exec_command(&(*st).store, &(*st).cur_batch[bi], now_ms, Vec::new());
+                if is_write {
+                    if len(rep) > 0 {
+                        if rep[0] != 45 {
+                            (*st).cur_chunks.push(journal_record(&(*st).cur_batch[bi], now_ms));
+                        };
+                    };
+                };
+                (*req).replies.push(rep);
+            };
+        };
+        bi = bi + 1;
+        if (*ctx).yield_every > 0 {
+            (*st).since_yield = (*st).since_yield + 1;
+            if (*st).since_yield >= (*ctx).yield_every {
+                let yst: i32 = sa_task_yield();
+                (*st).since_yield = 0;
+            };
+        };
+    }
+    if len((*st).cur_chunks) > 0 {
+        let chc2 = (*st).cur_chunks;
+        (*st).cur_chunks = Vec::new();
+        let okf = g_aof_append(st, chc2);
+    };
+    (*st).cur_batch = Vec::new();
+}
+
+fn g_exec_main(job: *ExecJob) {
+    let ctx = (*job).ctx;
+    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, store: (*job).store, free_ops: Vec::new(), broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new() }));
+    let pi: u64 = 0;
+    while pi < 8 {
+        let op = Box::into_raw(Box::new(AofOp { kind: AOF_OP_APPEND, idx: pi, chunks: Vec::new(), data: Vec::new(), result: false }));
+        (*st).free_ops.push(op);
+        pi = pi + 1;
+    }
+    // Loop body is a single call (the channel-op discipline
+    // at g_conn_main): the recv lives in g_exec_step.
+    while true {
+        g_exec_step(st);
+    }
+}
+
+// One executor cycle: take one request off the command
+// channel and dispatch it (sweep / serialize / batch).
+fn g_exec_step(st: *ExecSt) {
+        let ctx = (*st).ctx;
+        let (req, cl) = (*ctx).cmd_chan.recv();
+        if (*req).kind == CMD_SWEEP {
+            let swept: u64 = store_sweep(&(*st).store, sa_time_unix_ms());
+            g_signal(req);
+        } else {
+            if (*req).kind == CMD_SERIALIZE {
+                // Writer-requested auto-rewrite: serialize on
+                // the executor (the store owner), hand the
+                // payload to the writer as an install op. FIFO
+                // order on both channels is the whole ordering
+                // argument: appends sent before this install
+                // reflect commands the snapshot already
+                // includes... and appends sent after it carry
+                // post-snapshot records into the new file.
+                let data = dataset_serialize(&(*st).store, sa_time_unix_ms(), Vec::new());
+                let oki = g_aof_install(st, data, false);
+                g_signal(req);
+            } else {
+                g_exec_batch(st, req);
+                g_signal(req);
+            };
+        };
+}
+
+// ---- AOF writer goroutine ----
+// Owns the AofState and the file handle. Append ops are
+// written (and synced, per policy) in channel order through
+// the same aof_flush_pending the poll loop uses; install ops
+// swap in executor-serialized datasets through aof_swap_in.
+// The 100 ms tick drives the everysec fsync (aof_tick_sync)
+// and the auto-rewrite trigger, which asks the executor for a
+// serialization instead of touching the store itself.
+fn g_aof_main(job: *AofJob) {
+    // Loop body is a single call (the channel-op discipline
+    // at g_conn_main): the select lives in g_aof_step.
+    while true {
+        g_aof_step(job);
+    }
+}
+
+// One writer cycle: one op off the AOF channel, or the
+// 100 ms tick (everysec sync + auto-rewrite trigger).
+fn g_aof_step(job: *AofJob) {
+        let ctx = (*job).ctx;
+        select {
+            case let op = (*ctx).aof_chan.recv() {
+                if (*op).kind == AOF_OP_APPEND {
+                    if (*job).wst.broken {
+                        (*op).result = false;
+                    } else {
+                        // pending is empty between ops by
+                        // construction: aof_flush_pending
+                        // consumes it whole on every call.
+                        (*job).wst.pending = (*op).chunks;
+                        (*op).chunks = Vec::new();
+                        (*op).result = aof_flush_pending(&(*job).wst, sa_time_unix_ms());
+                    };
+                } else {
+                    if (*job).wst.broken {
+                        (*op).result = false;
+                    } else {
+                        (*op).result = aof_swap_in(&(*job).wst, &(*op).data, sa_time_unix_ms());
+                    };
+                    (*job).rw_out = false;
+                };
+                if (*job).wst.broken {
+                    (*ctx).aof_broken = true;
+                };
+                (*ctx).aof_recycle.send(op);
+            }
+            timeout(100000000) {
+                let now_ms: i64 = sa_time_unix_ms();
+                if (*job).wst.broken != true {
+                    let oks = aof_tick_sync(&(*job).wst, now_ms);
+                    if (*job).wst.broken {
+                        (*ctx).aof_broken = true;
+                    };
+                    if (*job).rw_out != true {
+                        if (*job).wst.size >= (*job).wst.base_size + AOF_REWRITE_MIN_GROWTH {
+                            if (*job).wst.size >= (*job).wst.base_size * 2 {
+                                (*job).rw_out = true;
+                                let sreq = (*job).sreq;
+                                (*sreq).kind = CMD_SERIALIZE;
+                                (*ctx).cmd_chan.send(sreq);
+                            };
+                        };
+                    };
+                };
+            }
+        }
+}
+
+// ---- expiry sweeper goroutine ----
+// The poll loop swept inside its round at a ~100 ms cadence;
+// here a dedicated goroutine posts a sweep request to the
+// executor at the same cadence (the store is only ever touched
+// by the executor, sweeps included).
+fn g_sweep_main(job: *SweepJob) {
+    // Loop body is a single call (the channel-op discipline
+    // at g_conn_main): the send lives in g_sweep_step.
+    while true {
+        g_sweep_step(job);
+    }
+}
+
+fn g_sweep_step(job: *SweepJob) {
+        let ctx = (*job).ctx;
+        let req = (*job).req;
+        let sst: i32 = sa_task_sleep_ms(100);
+        (*req).kind = CMD_SWEEP;
+        (*ctx).cmd_chan.send(req);
+}
+
+// ---- IO driver (runs on the main goroutine's frame) ----
+// Exactly one execution context touches sockets in this
+// model: the driver. It owns the listener and every
+// connection socket, waits on all of them with the readiness
+// face (in POLL_CHUNK-sized waits, the poll model's staging
+// discipline), accepts, reads chunks into per-connection
+// channels, and writes out queues fed by the connection
+// goroutines over the io_out channel.
+//
+// Why the driver sits on the main frame (measured; probes
+// 8/11/12/13/14 and 24/24b/24c in the delivery record): on
+// the current runtime, blocking net waits in spawned
+// goroutines do not compose -- once one goroutine is parked
+// in a blocking read, a second goroutine's blocking read on
+// another socket is starved indefinitely (its data is
+// delivered only after the first waiter leaves), a
+// goroutine's second blocking accept park poisons other
+// waiters the same way, and calling the readiness wait from
+// a spawned goroutine starves channel delivery
+// process-wide. The same readiness wait called from the
+// main goroutine composes (it is the poll model's seat).
+// Channel waits and sleeps compose fine anywhere. So all
+// net waits are concentrated in the driver on the main
+// frame, and every other goroutine parks on channels. The
+// runtime defects are registered for the compiler line;
+// this is the model shape that fits the runtime as
+// measured.
+//
+// The driver's own state is heap-side (IoSt), and its table
+// holds pointers to per-connection blocks, so retiring a
+// connection never moves another connection's bytes.
+struct IoSt {
+    ctx: *SrvCtx,
+    listener: u64,
+    wake_rx: u64,
+    // The connection table is a fixed slot array, not a Vec:
+    // pushing into a Vec field of a heap struct from inside a
+    // goroutine loop is a measured compiler/runtime defect on
+    // this toolchain (goroutine stack overflow abort; minimal
+    // repro probes 18f/18h in the delivery record). Index
+    // assignment into an array field is sound. The cap is far
+    // above the acceptance envelope (1200); at the cap the
+    // driver simply leaves new connections in the listen
+    // backlog for a later round.
+    slots: [*DriverConn; 8192],
+    n: u64,
+    lis_ready: u32,
+    wake_ready: u32,
+    any_dead: bool,
+}
+
+// Deep-copy the shared auth config for one connection (the
+// password bytes are cloned; the config is read-only after
+// startup, so the copy can never go stale).
+fn g_clone_auth(ap: *AuthConfig) -> AuthConfig {
+    // The source is the shared, startup-frozen config: read
+    // its password field in place, never bind it to a local --
+    // binding a Vec field of a heap struct MOVES the field out
+    // (the codebase's take idiom), which would drain the
+    // shared password for every later connection (measured:
+    // first connection AUTHs, all later ones WRONGPASS).
+    let pw: Vec<u8> = Vec::new();
+    let i: u64 = 0;
+    while i < len((*ap).password) {
+        pw.push((*ap).password[i]);
+        i = i + 1;
+    }
+    return AuthConfig { required: (*ap).required, password: pw };
+}
+
+fn g_io_index(st: *IoSt, fd: u64) -> (bool, u64) {
+    let i: u64 = 0;
+    while i < (*st).n {
+        if (*(*st).slots[i]).fd == fd {
+            return (true, i);
+        };
+        i = i + 1;
+    }
+    return (false, 0);
+}
+
+fn g_io_close(st: *IoSt, dc: *DriverConn) {
+    if (*dc).dead != true {
+        let cc: i32 = sa_std_close((*dc).fd);
+        (*dc).dead = true;
+        (*st).any_dead = true;
+    };
+}
+
+// Deliver the end-of-stream marker to a connection goroutine
+// (once, and only when its inbox has room -- a full inbox
+// means the goroutine is mid-dispatch; the marker is retried
+// on later rounds until it lands).
+fn g_io_send_eof(dc: *DriverConn) {
+    if (*dc).eof_sent {
+        return;
+    };
+    if (*dc).inbox.len() >= 16 {
+        return;
+    };
+    let m = Box::into_raw(Box::new(IoMsg { bytes: Vec::new(), eof: true }));
+    (*dc).inbox.send(m);
+    (*dc).eof_sent = true;
+}
+
+// Apply every queued io_out message: reply bytes join the
+// connection's out queue; close requests act in channel
+// order, so bytes queued before a close are flushed first.
+fn g_io_drain_out(st: *IoSt) {
+    let ctx = (*st).ctx;
+    let pending: Vec<*IoOut> = Vec::new();
+    let draining: bool = true;
+    while draining {
+        select {
+            case let m = (*ctx).io_out.recv() {
+                pending.push(m);
+            }
+            default {
+                draining = false;
+            }
+        }
+    }
+    let pi: u64 = 0;
+    while pi < len(pending) {
+        let m = pending[pi];
+        let (found, idx) = g_io_index(st, (*m).fd);
+        if found {
+            let dc = (*st).slots[idx];
+            if (*dc).dead != true {
+                if (*m).kind == IO_OUT_BYTES {
+                    let mb = (*m).bytes;
+                    let oq = (*dc).outq;
+                    (*dc).outq = bytes_push_range(oq, &mb, 0, len(mb));
+                } else {
+                    if (*m).kind == IO_OUT_CLOSE_NOW {
+                        g_io_close(st, dc);
+                    } else {
+                        (*dc).close_after_flush = true;
+                        if (*dc).out_off >= len((*dc).outq) {
+                            g_io_close(st, dc);
+                        };
+                    };
+                };
+            };
+        };
+        pi = pi + 1;
+    }
+}
+
+fn g_io_wait(st: *IoSt) -> bool {
+    let hs: [u64; 128] = [0u64; 128];
+    let ins: [u32; 128] = [0u32; 128];
+    let rds: [u32; 128] = [0u32; 128];
+    let hp: ptr = PTR_BYTE_ADD(&hs, 0);
+    let ip: ptr = PTR_BYTE_ADD(&ins, 0);
+    let rp: ptr = PTR_BYTE_ADD(&rds, 0);
+    (*st).lis_ready = 0;
+    (*st).wake_ready = 0;
+    let ready_count: u64 = 0;
+    let waited: bool = false;
+    let next_i: u64 = 0;
+    let phase: u64 = 0;
+    let total: u64 = (*st).n + 2;
+    while phase * 128 < total {
+        // stage one chunk: slot order is listener, wake,
+        // then connections in table order
+        let n: u64 = 0;
+        let chunk_start: u64 = phase * 128;
+        let slot: u64 = chunk_start;
+        while n < 128 {
+            if slot >= total {
+                break;
+            };
+            if slot == 0 {
+                hs[n] = (*st).listener;
+                ins[n] = SA_NET_POLL_READ;
+            } else {
+                if slot == 1 {
+                    hs[n] = (*st).wake_rx;
+                    ins[n] = SA_NET_POLL_READ;
+                } else {
+                    let dc = (*st).slots[slot - 2];
+                    hs[n] = (*dc).fd;
+                    let it: u32 = 0;
+                    if (*dc).read_closed != true {
+                        it = it + SA_NET_POLL_READ;
+                    };
+                    if (*dc).out_off < len((*dc).outq) {
+                        it = it + SA_NET_POLL_WRITE;
+                    };
+                    ins[n] = it;
+                };
+            };
+            n = n + 1;
+            slot = slot + 1;
+        }
+        let tmo: i32 = 0;
+        if waited != true {
+            tmo = 50;
+        };
+        let pst: i32 = sa_std_net_poll_wait(hp, ip, n, tmo, rp, &ready_count);
+        waited = true;
+        if pst != SA_STD_OK {
+            return false;
+        };
+        // scatter bits back over the same slot sequence
+        let k: u64 = 0;
+        let slot2: u64 = chunk_start;
+        while k < n {
+            if slot2 == 0 {
+                (*st).lis_ready = rds[k];
+            } else {
+                if slot2 == 1 {
+                    (*st).wake_ready = rds[k];
+                } else {
+                    (*(*st).slots[slot2 - 2]).ready = rds[k];
+                };
+            };
+            k = k + 1;
+            slot2 = slot2 + 1;
+        }
+        phase = phase + 1;
+    }
+    return true;
+}
+
+// Accept every pending connection (bounded per round, as in
+// the poll model): each gets a nonblocking socket owned by
+// this driver, a DriverConn block, an inbox channel, and its
+// own connection goroutine, registered with the supervisor.
+fn g_io_accept(st: *IoSt) {
+    let ctx = (*st).ctx;
+    let accepts: u64 = 0;
+    while accepts < 64 {
+        if (*st).n >= 8192 {
+            break;
+        };
+        let h: u64 = 0;
+        let ast: i32 = sa_std_net_tcp_accept((*st).listener, &h);
+        if ast != SA_STD_OK {
+            break;
+        };
+        if h == 0 {
+            break;
+        };
+        let nb: i32 = sa_std_net_tcp_stream_set_nonblocking(h, 1);
+        if nb != SA_STD_OK {
+            let cc0: i32 = sa_std_close(h);
+            accepts = accepts + 1;
+        } else {
+            let inbox: Chan<*IoMsg> = Chan::new(16);
+            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_off: 0, ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false }));
+            if (*st).n < 8192 {
+                (*st).slots[(*st).n] = dc;
+                (*st).n = (*st).n + 1;
+            };
+            let dchan: Chan<u64> = Chan::new(0);
+            let req = Box::into_raw(Box::new(CmdReq { kind: CMD_BATCH, ack: true, batch: Vec::new(), replies: Vec::new(), done: dchan }));
+            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outbuf: Vec::new(), authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
+            let gh = go g_conn_main(cj);
+            (*ctx).sup_reg.send((gh, h));
+            accepts = accepts + 1;
+        };
+    }
+}
+
+// Read at most one chunk from a ready connection and hand it
+// to its goroutine; a full inbox applies backpressure (the
+// bytes stay in the socket; readiness is level-triggered).
+// EOF and fatal read errors close the read side and deliver
+// the end-of-stream marker.
+fn g_io_read(st: *IoSt, dc: *DriverConn) {
+    if (*dc).read_closed {
+        return;
+    };
+    if (*dc).inbox.len() >= 16 {
+        return;
+    };
+    let buf: [u8; 4096] = [0u8; 4096];
+    let bp: ptr = PTR_BYTE_ADD(&buf, 0);
+    let nread: u64 = 0;
+    let rst: i32 = sa_std_net_tcp_stream_read((*dc).fd, bp, 4096, &nread);
+    if rst != SA_STD_OK {
+        // would-block on a nonblocking socket, or a real
+        // error; the ERROR readiness bit distinguishes a dead
+        // socket from a spurious wakeup
+        if ((*dc).ready & SA_NET_POLL_ERROR) != 0 {
+            (*dc).read_closed = true;
+        };
+        return;
+    };
+    if nread == 0 {
+        (*dc).read_closed = true;
+        return;
+    };
+    let data: Vec<u8> = Vec::new();
+    let j: u64 = 0;
+    while j < nread {
+        data.push(buf[j]);
+        j = j + 1;
+    }
+    let m = Box::into_raw(Box::new(IoMsg { bytes: data, eof: false }));
+    (*dc).inbox.send(m);
+}
+
+// One write attempt on a connection with queued output (the
+// poll model's conn_flush, one 4 KiB staged chunk): partial
+// progress is kept; a drained queue triggers a pending
+// close-after-flush; a hard error closes the connection and
+// notifies its goroutine.
+fn g_io_write(st: *IoSt, dc: *DriverConn) {
+    if (*dc).out_off >= len((*dc).outq) {
+        return;
+    };
+    let avail: u64 = len((*dc).outq) - (*dc).out_off;
+    let chunk: u64 = avail;
+    if chunk > 4096 {
+        chunk = 4096;
+    };
+    let arr: [u8; 4096] = [0u8; 4096];
+    let j: u64 = 0;
+    while j < chunk {
+        arr[j] = (*dc).outq[(*dc).out_off + j];
+        j = j + 1;
+    }
+    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    let written: u64 = 0;
+    let wst: i32 = sa_std_net_tcp_stream_write((*dc).fd, ap, chunk, &written);
+    if wst != SA_STD_OK {
+        if ((*dc).ready & SA_NET_POLL_ERROR) != 0 {
+            g_io_close(st, dc);
+            (*dc).read_closed = true;
+            g_io_send_eof(dc);
+        };
+        return;
+    };
+    if written == 0 {
+        return;
+    };
+    (*dc).out_off = (*dc).out_off + written;
+    if (*dc).out_off == len((*dc).outq) {
+        (*dc).outq = Vec::new();
+        (*dc).out_off = 0;
+        if (*dc).close_after_flush {
+            g_io_close(st, dc);
+        };
+    };
+}
+
+fn g_io_run(job: *IoJob) -> i32 {
+    let ctx = (*job).ctx;
+    let dummy_inbox: Chan<*IoMsg> = Chan::new(1);
+    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_off: 0, ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true }));
+    let st = Box::into_raw(Box::new(IoSt { ctx: ctx, listener: (*job).listener, wake_rx: (*job).wake_rx, slots: [sentinel; 8192], n: 0, lis_ready: 0, wake_ready: 0, any_dead: false }));
+    while (*ctx).core_dead != true {
+        g_io_drain_out(st);
+        if g_io_wait(st) {
+            if (*st).wake_ready != 0 {
+                // drain the wake socket (its bytes carry no
+                // information; one pending byte wakes a round)
+                let wbuf: [u8; 64] = [0u8; 64];
+                let wp: ptr = PTR_BYTE_ADD(&wbuf, 0);
+                let wn: u64 = 0;
+                let wst2: i32 = sa_std_net_tcp_stream_read((*st).wake_rx, wp, 64, &wn);
+            };
+            if ((*st).lis_ready & SA_NET_POLL_READ) != 0 {
+                g_io_accept(st);
+            };
+            let ci: u64 = 0;
+            while ci < (*st).n {
+                let dc = (*st).slots[ci];
+                if (*dc).dead != true {
+                    if ((*dc).ready & (SA_NET_POLL_READ + SA_NET_POLL_ERROR)) != 0 {
+                        g_io_read(st, dc);
+                    };
+                    if (*dc).read_closed {
+                        g_io_send_eof(dc);
+                    };
+                    if (*dc).dead != true {
+                        g_io_write(st, dc);
+                    };
+                };
+                ci = ci + 1;
+            }
+        };
+        if (*st).any_dead {
+            // swap-remove the dead slots (pointer moves only;
+            // order in the table carries no semantics)
+            let ki: u64 = 0;
+            while ki < (*st).n {
+                if (*(*st).slots[ki]).dead {
+                    (*st).n = (*st).n - 1;
+                    (*st).slots[ki] = (*st).slots[(*st).n];
+                } else {
+                    ki = ki + 1;
+                };
+            }
+            (*st).any_dead = false;
+        };
+    }
+    return G_EXIT_CORE_DEAD;
+}
+
+// ---- entry point + supervisor ----
+// Startup mirrors run_server (server.sla): replay + open the
+// AOF before listening (any failure exits 69), listen (66),
+// listener nonblocking setup (67). The frame then becomes the
+// supervisor instead of an event loop. Exit codes 65/66/69
+// are shared with the poll model; 67 in this model also
+// covers the wake-socket setup; 71 is new (core goroutine
+// death: executor, AOF writer, or IO driver gone -- see the
+// header comment).
+fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: AofConfig) -> i32 {
+    if len(host) > 63 {
+        return 65;
+    };
+    // The AOF state is built and opened in this frame first
+    // (exactly the poll model's startup): calling aof_open
+    // through a borrow of an already-boxed state segfaults at
+    // startup on this toolchain (measured; staged bisection
+    // in the delivery record). After startup the state moves
+    // into the AOF writer's job block as an owned value (see
+    // AofJob.wst).
+    let aof = aof_state_new(&aof_cfg);
+    if aof.enabled {
+        let rc: i32 = aof_replay(&aof_cfg, &store, sa_time_unix_ms());
+        if rc != 0 {
+            return 69;
+        };
+        if aof_open(&aof) != true {
+            return 69;
+        };
+        aof.last_sync_ms = sa_time_unix_ms();
+    };
+    let aof_enabled_v: bool = aof.enabled;
+    let aof_fsync_v: u8 = aof.fsync_mode;
+    let harr: [u8; 64] = [0u8; 64];
+    let hi: u64 = 0;
+    while hi < len(host) {
+        harr[hi] = host[hi];
+        hi = hi + 1;
+    }
+    let hp: ptr = PTR_BYTE_ADD(&harr, 0);
+    let listener: u64 = 0;
+    let bound: u32 = 0;
+    let lst: i32 = sa_std_net_tcp_listen(hp, len(host), port, &listener, &bound);
+    if lst != SA_STD_OK {
+        return 66;
+    };
+    let lnb: i32 = sa_std_net_tcp_listener_set_nonblocking(listener, 1);
+    if lnb != SA_STD_OK {
+        return 67;
+    };
+    // Wake channel for the IO driver: a loopback
+    // self-connection whose read end sits in the driver's poll
+    // set, so queued replies wake it immediately.
+    let wl: u64 = 0;
+    let wbound: u32 = 0;
+    let wst0: i32 = sa_std_net_tcp_listen(STR_PTR("127.0.0.1"), 9, 0, &wl, &wbound);
+    if wst0 != SA_STD_OK {
+        return 67;
+    };
+    let wake_tx: u64 = 0;
+    let wct: i32 = sa_std_net_tcp_connect(STR_PTR("127.0.0.1"), 9, wbound, &wake_tx);
+    if wct != SA_STD_OK {
+        return 67;
+    };
+    let wake_rx: u64 = 0;
+    let wat: i32 = sa_std_net_tcp_accept(wl, &wake_rx);
+    if wat != SA_STD_OK {
+        return 67;
+    };
+    let wcl: i32 = sa_std_close(wl);
+    let wnb1: i32 = sa_std_net_tcp_stream_set_nonblocking(wake_tx, 1);
+    if wnb1 != SA_STD_OK {
+        return 67;
+    };
+    let wnb2: i32 = sa_std_net_tcp_stream_set_nonblocking(wake_rx, 1);
+    if wnb2 != SA_STD_OK {
+        return 67;
+    };
+    // Manual yield cadence for this module's CPU loops (bench
+    // knob; absent or invalid keeps the default 128).
+    let yield_every: u64 = 128;
+    let ye = env_value(STR_PTR("SLAREDIS_YIELD_EVERY"), STR_LEN("SLAREDIS_YIELD_EVERY"));
+    if ye.present {
+        let (ok_y, v_y) = parse_i64_full(&ye.value);
+        if ok_y && v_y >= 0 {
+            yield_every = v_y as u64;
+        };
+    };
+    let cmd_chan: Chan<*CmdReq> = Chan::new(256);
+    let aof_chan: Chan<*AofOp> = Chan::new(64);
+    let aof_recycle: Chan<*AofOp> = Chan::new(64);
+    let sup_reg: Chan<(u64, u64)> = Chan::new(256);
+    let io_out: Chan<*IoOut> = Chan::new(256);
+    let authp = Box::into_raw(Box::new(auth));
+    let ctx = Box::into_raw(Box::new(SrvCtx {
+        auth: authp,
+        aof_enabled: aof_enabled_v,
+        aof_fsync: aof_fsync_v,
+        cmd_chan: cmd_chan,
+        aof_chan: aof_chan,
+        aof_recycle: aof_recycle,
+        sup_reg: sup_reg,
+        io_out: io_out,
+        wake_tx: wake_tx,
+        core_dead: false,
+        aof_broken: false,
+        yield_every: yield_every,
+    }));
+    // Spawn order: consumers first, the IO driver last, so no
+    // connection can be accepted before its executor exists.
+    let ej = Box::into_raw(Box::new(ExecJob { ctx: ctx, store: store }));
+    let h_exec = go g_exec_main(ej);
+    let m_exec = monitor(h_exec);
+    let m_aof: Chan<(u64, i32)> = Chan::new(0);
+    if aof_enabled_v {
+        let sd: Chan<u64> = Chan::new(1);
+        let sreq = Box::into_raw(Box::new(CmdReq { kind: CMD_SERIALIZE, ack: false, batch: Vec::new(), replies: Vec::new(), done: sd }));
+        let aj = Box::into_raw(Box::new(AofJob { ctx: ctx, wst: aof, sreq: sreq, rw_out: false }));
+        let h_aof = go g_aof_main(aj);
+        m_aof = monitor(h_aof);
+    };
+    let swd: Chan<u64> = Chan::new(1);
+    let swreq = Box::into_raw(Box::new(CmdReq { kind: CMD_SWEEP, ack: false, batch: Vec::new(), replies: Vec::new(), done: swd }));
+    let swj = Box::into_raw(Box::new(SweepJob { ctx: ctx, req: swreq }));
+    let h_sweep = go g_sweep_main(swj);
+    let m_sweep = monitor(h_sweep);
+    let sj = Box::into_raw(Box::new(SupJob { ctx: ctx, m_exec: m_exec, m_aof: m_aof, m_sweep: m_sweep }));
+    let h_sup = go g_sup_main(sj);
+    // The IO driver runs on this (main) frame, not in a
+    // spawned goroutine: sa_std_net_poll_wait called from a
+    // spawned goroutine starves channel delivery for the
+    // other goroutines (measured; probes 24/24b/24c in the
+    // delivery record), while from the main goroutine -- the
+    // poll model's own seat -- it composes. The supervisor is
+    // a goroutine instead; it only ever parks on channels.
+    let ioj = Box::into_raw(Box::new(IoJob { ctx: ctx, listener: listener, wake_rx: wake_rx }));
+    return g_io_run(ioj);
+}
+
+// The supervisor goroutine: owns every monitor channel and
+// the sweeper's respawn; never touches sockets or the store.
+fn g_sup_main(sj: *SupJob) {
+    let ctx = (*sj).ctx;
+    let dummy_mon: Chan<(u64, i32)> = Chan::new(1);
+    // Supervisor loop: one select whose arms are the
+    // connection-monitor watch (round-robin over the table),
+    // the core monitors (executor, AOF writer -- any exit is
+    // process-fatal by design and is reported through
+    // ctx.core_dead), the sweeper monitor (respawned), and
+    // sup_reg registrations; a 20 ms timeout sets the idle
+    // cadence. See the one-select constraint at the loop.
+    // Slot 0 is a permanent sentinel: the dummy monitor
+    // channel (never delivers), so the select's watch arm
+    // always has a valid table entry even with no live
+    // connections; real registrations append from slot 1.
+    let sup = Box::into_raw(Box::new(SupSt { mons: [dummy_mon; 8192], mstreams: [0u64; 8192], n: 1, scan_i: 0, conn_traps: 0, sweep_restarts: 0 }));
+    // Loop body is a single call (the channel-op discipline
+    // at g_conn_main): the whole cycle lives in g_sup_step,
+    // whose frame rewinds on return. The step carries the
+    // current sweeper monitor in (*sj).m_sweep (it changes
+    // on respawn).
+    let alive: bool = true;
+    while alive {
+        alive = g_sup_step(sup, sj);
+    }
+}
+
+// One supervisor cycle: one select (all waits as arms),
+// then the actions for whichever arm fired. Returns false
+// when a core goroutine has exited (the caller then
+// returns, ending the supervisor; ctx.core_dead is set).
+fn g_sup_step(sup: *SupSt, sj: *SupJob) -> bool {
+        let ctx = (*sj).ctx;
+        let m_exec = (*sj).m_exec;
+        let m_aof = (*sj).m_aof;
+    // The select merges every wait into one statement, and
+    // the whole cycle lives in this called function -- two
+    // measured runtime constraints (probes 27/28/30/31 in
+    // the delivery record): (1) channel operations
+    // (send/recv/select) textually inside a never-returning
+    // loop body leak fixed-stack per iteration -- a plain
+    // recv in a loop body dies within thousands of
+    // iterations, a select faster in proportion to its arm
+    // count (the five-select form of this loop died at ~643
+    // iterations) -- while the same operations inside a
+    // CALLED function rewind on return (300k calls clean);
+    // (2) arm order is the priority order under the
+    // runtime's declaration-order bias: connection-exit
+    // first (rarest, hygiene), core-death next, sweeper,
+    // registrations last (frequent; they cannot starve the
+    // rare arms, and when only registrations are ready the
+    // arm fires immediately, so bursts drain at full speed).
+    // The connection monitor arm watches ONE table entry per
+    // cycle in round-robin (the watched channel is chosen
+    // before the select), so a trapped connection is retired
+    // within n cycles -- seconds at the 8192 cap, ample for
+    // a hygiene path.
+        if (*sup).scan_i >= (*sup).n {
+            (*sup).scan_i = 0;
+        };
+        let watch_idx = (*sup).scan_i;
+        let watch = (*sup).mons[watch_idx];
+        (*sup).scan_i = (*sup).scan_i + 1;
+        let got_reg: bool = false;
+        let regh: u64 = 0;
+        let regfd: u64 = 0;
+        let dead: bool = false;
+        let sweep_dead: bool = false;
+        let exit_found: bool = false;
+        let exit_code: i32 = 0;
+        select {
+            case let mc = watch.recv() {
+                exit_found = true;
+                exit_code = mc.1;
+            }
+            case let m1 = m_exec.recv() {
+                dead = true;
+            }
+            case let m2 = m_aof.recv() {
+                dead = true;
+            }
+            case let m4 = (*sj).m_sweep.recv() {
+                sweep_dead = true;
+            }
+            case let reg = (*ctx).sup_reg.recv() {
+                got_reg = true;
+                regh = reg.0;
+                regfd = reg.1;
+            }
+            timeout(20000000) {
+            }
+        }
+        if got_reg {
+            if (*sup).n < 8192 {
+                (*sup).mons[(*sup).n] = monitor(regh);
+                (*sup).mstreams[(*sup).n] = regfd;
+                (*sup).n = (*sup).n + 1;
+            };
+        };
+        if dead {
+            // a core goroutine is gone: flag it; the main
+            // frame's IO driver notices within one round and
+            // returns G_EXIT_CORE_DEAD for the process
+            (*ctx).core_dead = true;
+            return false;
+        };
+        if sweep_dead {
+            (*sup).sweep_restarts = (*sup).sweep_restarts + 1;
+            let swd2: Chan<u64> = Chan::new(1);
+            let swreq2 = Box::into_raw(Box::new(CmdReq { kind: CMD_SWEEP, ack: false, batch: Vec::new(), replies: Vec::new(), done: swd2 }));
+            let swj2 = Box::into_raw(Box::new(SweepJob { ctx: ctx, req: swreq2 }));
+            let h_sweep2 = go g_sweep_main(swj2);
+            (*sj).m_sweep = monitor(h_sweep2);
+        };
+        if exit_found {
+            if exit_code != 0 {
+                // A trapped connection goroutine may have left
+                // its socket half-served; sockets belong to
+                // the IO driver, so the close goes through it.
+                (*sup).conn_traps = (*sup).conn_traps + 1;
+                let cm = Box::into_raw(Box::new(IoOut { fd: (*sup).mstreams[watch_idx], kind: IO_OUT_CLOSE_NOW, bytes: Vec::new() }));
+                (*ctx).io_out.send(cm);
+                g_poke(ctx);
+            };
+            (*sup).n = (*sup).n - 1;
+            (*sup).mons[watch_idx] = (*sup).mons[(*sup).n];
+            (*sup).mstreams[watch_idx] = (*sup).mstreams[(*sup).n];
+        };
+        return true;
+}
