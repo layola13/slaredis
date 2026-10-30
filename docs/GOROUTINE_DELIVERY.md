@@ -327,12 +327,17 @@ poll 8.7k–16.2k vs goroutine 3.1k–6.3k (gor/poll ≈ 0.36–0.39
 except get 0.39); P=16 get is 79.2k vs 59.8k (0.76).
 
 Diagnostic 10k-key keyspace (-r 10000, not a gate
-scenario): set poll 4393 / goroutine 1870; get poll 16540
-/ goroutine 6138 (goroutine figures re-measured with the
+scenario): set poll 4393 / goroutine 3340; get poll 16540
+/ goroutine 5696 (goroutine figures re-measured with the
 script's own method — medians of 3 measured rounds after 1
 warmup, server restarted per round — after the
-interference disclosed below). The linear-scan keyspace
+interference disclosed below; raw rounds: set 3517 / 3340
+/ 3168, get 5696 / 5669 / 6123). The linear-scan keyspace
 effect dominates the SET figure in both models.
+(Second erratum, same cause as the fsync one below: the
+first-pushed goroutine diagnostic figures, 1870 / 6138,
+were a misreading of interleaved background output; the
+raw rounds above are the surviving record.)
 
 **Reading of the delta (the context-switch cost, stated as
 charter requires).** At -P 1 the goroutine model is
