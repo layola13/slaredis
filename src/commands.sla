@@ -519,7 +519,7 @@ fn cmd_hset(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
                     let seen: bool = false;
                     let k: u64 = 2;
                     while k < j {
-                        if bytes_eq(&args[k], &args[j]) {
+                        if bytes_eq_elems(args, k, j) {
                             seen = true;
                         };
                         k = k + 2;
@@ -945,7 +945,7 @@ fn cmd_sadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
                     let seen: bool = false;
                     let k: u64 = 2;
                     while k < j {
-                        if bytes_eq(&args[k], &args[j]) {
+                        if bytes_eq_elems(args, k, j) {
                             seen = true;
                         };
                         k = k + 1;
@@ -1122,14 +1122,31 @@ fn bytes_lt(a: &Vec<u8>, b: &Vec<u8>) -> bool {
 }
 
 // true when zset row x must sort before row y: score asc, then
-// member bytes asc (Redis's lexicographic tie-break).
+// member bytes asc (Redis's lexicographic tie-break). The member
+// compare is inlined over indexed reads: a bytes_lt(&rows[x].member,
+// &rows[y].member) call borrows two places of one container at once,
+// which the current checker's place accounting rejects (see
+// bytes_eq_elems in bytes.sla). Semantics identical to bytes_lt.
 fn zrows_before(rows: &Vec<ZRow>, x: u64, y: u64) -> bool {
     let sx: f64 = rows[x].score;
     let sy: f64 = rows[y].score;
     if sx != sy {
         return sx < sy;
     };
-    return bytes_lt(&rows[x].member, &rows[y].member);
+    let la: u64 = len(rows[x].member);
+    let lb: u64 = len(rows[y].member);
+    let n: u64 = la;
+    if lb < n {
+        n = lb;
+    };
+    let i: u64 = 0;
+    while i < n {
+        if rows[x].member[i] != rows[y].member[i] {
+            return rows[x].member[i] < rows[y].member[i];
+        };
+        i = i + 1;
+    }
+    return la < lb;
 }
 
 // Insertion-sort a scratch index over `rows` into ZRANGE order.
@@ -1236,7 +1253,7 @@ fn cmd_zadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
                     let seen: bool = false;
                     let k: u64 = 2;
                     while k < j {
-                        if bytes_eq(&args[k + 1], &args[j + 1]) {
+                        if bytes_eq_elems(args, k + 1, j + 1) {
                             seen = true;
                         };
                         k = k + 2;

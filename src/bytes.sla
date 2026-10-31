@@ -34,6 +34,27 @@ fn bytes_eq(a: &Vec<u8>, b: &Vec<u8>) -> bool {
     return true;
 }
 
+// bytes_eq of two elements of ONE vector, under a single borrow of
+// the container. The current checker's place accounting rejects a
+// call that borrows two elements of the same container at once
+// (BorrowConflict on `args[_]` / `args[_]`, even for shared borrows);
+// the dedup scans in commands.sla compare args[k] with args[j], so
+// they go through this shape instead. Semantics identical to
+// bytes_eq(&a[i], &a[j]).
+fn bytes_eq_elems(a: &Vec<Vec<u8>>, i: u64, j: u64) -> bool {
+    if len(a[i]) != len(a[j]) {
+        return false;
+    };
+    let t: u64 = 0;
+    while t < len(a[i]) {
+        if a[i][t] != a[j][t] {
+            return false;
+        };
+        t = t + 1;
+    }
+    return true;
+}
+
 // Case-insensitive (ASCII) compare of a byte string against a string
 // literal given as (ptr, len) from STR_PTR / STR_LEN. Used for
 // command-name matching: RESP command names are case-insensitive.

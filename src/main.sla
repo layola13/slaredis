@@ -85,10 +85,11 @@ fn main() -> i32 {
         port = v as u32;
     };
     let auth_cfg = auth_config_from_env();
-    let (aof_status, aof_cfg) = aof_config_from_env();
-    if aof_status != 0 {
-        return aof_status;
+    let aof_res = aof_config_from_env();
+    if aof_res.status != 0 {
+        return aof_res.status;
     };
+    let aof_cfg = aof_res.cfg;
     // The store starts as a plain value. The goroutine model
     // takes it by value (its executor owns it as a value field
     // of its state block -- see gserver.sla's ExecSt note on
@@ -132,13 +133,21 @@ fn auth_config_from_env() -> AuthConfig {
     return AuthConfig { required: false, password: Vec::new() };
 }
 
-// Returns (status, config): status 68 on an invalid persistence
+// Returns {status, config}: status 68 on an invalid persistence
 // configuration (over-long AOF path, unknown fsync mode). The
-// config is always bound to a named local before the tuple
-// return: a struct literal nested directly in a tuple literal
-// leaves the construction register live at the return (a
-// MemoryLeak referee trap in the current toolchain).
-fn aof_config_from_env() -> (i32, AofConfig) {
+// config is always bound to a named local before the return: a
+// struct literal nested directly in a return leaves the
+// construction register live at the return (a MemoryLeak referee
+// trap in the current toolchain).
+// 2026-10-31 (optimisation line): the return is a wrapper struct,
+// not a tuple -- on sci bbd06f9e / sla ccbffb2a the tuple form of
+// THIS function traps the host verifier (MemoryLeak 1012, register
+// off_cfg live at the final return) in the full module, while the
+// identical function compiled standalone passes; the struct-return
+// shape (cf. auth_config_from_env) is the dodge. Compiler-side
+// evidence preserved in the optimisation line's report.
+struct AofConfigResult { status: i32, cfg: AofConfig }
+fn aof_config_from_env() -> AofConfigResult {
     let mode: u8 = AOF_FSYNC_EVERYSEC;
     let fs_env = env_value(STR_PTR("SLAREDIS_AOF_FSYNC"), STR_LEN("SLAREDIS_AOF_FSYNC"));
     if fs_env.present {
@@ -152,7 +161,7 @@ fn aof_config_from_env() -> (i32, AofConfig) {
                     mode = AOF_FSYNC_NO;
                 } else {
                     let bad = AofConfig { enabled: false, path: Vec::new(), fsync_mode: AOF_FSYNC_EVERYSEC };
-                    return (68, bad);
+                    return AofConfigResult { status: 68, cfg: bad };
                 };
             };
         };
@@ -161,13 +170,13 @@ fn aof_config_from_env() -> (i32, AofConfig) {
     if aof_env.present {
         if len(aof_env.value) > 255 {
             let bad2 = AofConfig { enabled: false, path: Vec::new(), fsync_mode: AOF_FSYNC_EVERYSEC };
-            return (68, bad2);
+            return AofConfigResult { status: 68, cfg: bad2 };
         };
         if len(aof_env.value) > 0 {
             let ok_cfg = AofConfig { enabled: true, path: aof_env.value, fsync_mode: mode };
-            return (0, ok_cfg);
+            return AofConfigResult { status: 0, cfg: ok_cfg };
         };
     };
     let off_cfg = AofConfig { enabled: false, path: Vec::new(), fsync_mode: mode };
-    return (0, off_cfg);
+    return AofConfigResult { status: 0, cfg: off_cfg };
 }
