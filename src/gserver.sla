@@ -287,6 +287,12 @@ struct AofJob {
     // borrow of a heap-resident field is sound). The writer
     // goroutine is the state's only owner.
     wst: AofState,
+    // Step 2 group-write merge buffer: each drained group's
+    // record chunks are appended here (bytes_push_range
+    // accumulation is linear on this toolchain -- probe_gbuf:
+    // 0.11-0.19 us/byte across 26x80 B, 256x80 B and 8x64 KiB
+    // shapes) and written with one aof_write_group call.
+    gbuf: Vec<u8>,
     sreq: *CmdReq,
     rw_out: bool,
 }
@@ -1053,50 +1059,70 @@ fn g_aof_step(job: *AofJob) {
                     let has_install: bool = false;
                     let any_write: bool = false;
                     let write_failed: bool = false;
-                    // Write the first op, then keep draining
-                    // appends that are already queued.
-                    let gi: u64 = 0;
+                    // Step 2 (group write): COLLECT the whole
+                    // drained group first, merging every op's
+                    // record chunks into the job's gbuf, then pay
+                    // ONE aof_write_group for the group instead
+                    // of one aof_write_all call chain per record.
+                    // Arrivals during the write form the next
+                    // group; the group cap (256) and the install
+                    // truncation are unchanged.
                     let draining: bool = true;
                     while draining {
-                        let gop = group[gi];
-                        if (*job).wst.broken {
-                            (*gop).result = false;
-                            write_failed = true;
+                        if len(group) >= 256 {
+                            draining = false;
                         } else {
-                            (*job).wst.pending = (*gop).chunks;
-                            (*gop).chunks = Vec::new();
-                            let wok = aof_flush_write(&(*job).wst, sa_time_unix_ms());
-                            (*gop).result = wok;
-                            if wok {
-                                any_write = true;
-                            } else {
-                                write_failed = true;
-                            };
-                        };
-                        gi = gi + 1;
-                        if gi < len(group) {
-                            // more already collected
-                        } else {
-                            if len(group) >= 256 {
-                                draining = false;
-                            } else {
-                                select {
-                                    case let op2 = (*ctx).aof_chan.recv() {
-                                        if (*op2).kind == AOF_OP_INSTALL {
-                                            install_op = op2;
-                                            has_install = true;
-                                            draining = false;
-                                        } else {
-                                            group.push(op2);
-                                        };
-                                    }
-                                    default {
+                            select {
+                                case let op2 = (*ctx).aof_chan.recv() {
+                                    if (*op2).kind == AOF_OP_INSTALL {
+                                        install_op = op2;
+                                        has_install = true;
                                         draining = false;
-                                    }
+                                    } else {
+                                        group.push(op2);
+                                    };
                                 }
-                            };
+                                default {
+                                    draining = false;
+                                }
+                            }
                         };
                     }
+                    let ci2: u64 = 0;
+                    while ci2 < len(group) {
+                        let cop = group[ci2];
+                        let chi: u64 = 0;
+                        while chi < len((*cop).chunks) {
+                            let gb = (*job).gbuf;
+                            (*job).gbuf = bytes_push_range(gb, &(*cop).chunks[chi], 0, len((*cop).chunks[chi]));
+                            chi = chi + 1;
+                        }
+                        (*cop).chunks = Vec::new();
+                        ci2 = ci2 + 1;
+                    }
+                    if (*job).wst.broken {
+                        write_failed = true;
+                        let bi: u64 = 0;
+                        while bi < len(group) {
+                            let bop = group[bi];
+                            (*bop).result = false;
+                            bi = bi + 1;
+                        }
+                    } else {
+                        let wok = aof_write_group(&(*job).wst, &(*job).gbuf);
+                        let wi: u64 = 0;
+                        while wi < len(group) {
+                            let wop = group[wi];
+                            (*wop).result = wok;
+                            wi = wi + 1;
+                        }
+                        if wok {
+                            any_write = true;
+                        } else {
+                            write_failed = true;
+                        };
+                    };
+                    (*job).gbuf = Vec::new();
                     if (*ctx).aof_fsync == AOF_FSYNC_ALWAYS {
                         if any_write && write_failed != true {
                             let sok = aof_sync_now(&(*job).wst, sa_time_unix_ms());
@@ -1709,7 +1735,7 @@ fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig
     if aof_enabled_v {
         let sd: Chan<u64> = Chan::new(1);
         let sreq = Box::into_raw(Box::new(CmdReq { kind: CMD_SERIALIZE, ack: false, batch: Vec::new(), replies: Vec::new(), done: sd }));
-        let aj = Box::into_raw(Box::new(AofJob { ctx: ctx, wst: aof, sreq: sreq, rw_out: false }));
+        let aj = Box::into_raw(Box::new(AofJob { ctx: ctx, wst: aof, gbuf: Vec::new(), sreq: sreq, rw_out: false }));
         let h_aof = go g_aof_main(aj);
         m_aof = monitor(h_aof);
     };

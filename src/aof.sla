@@ -235,6 +235,34 @@ fn aof_flush_write(st: &AofState, now_ms: i64) -> bool {
     return true;
 }
 
+// Group-write form (2026-10-31, fast-path step 2): write one
+// already-merged buffer with aof_flush_write's exact bookkeeping
+// (enabled/broken gates, size/unsynced accounting, broken latch).
+// The goroutine writer merges a whole drained group's records
+// into one buffer -- record chunk boundaries carry no meaning on
+// disk -- and pays ONE write pass for the group: aof_write_all
+// stages 4 KiB slices, so the syscall count drops from
+// per-record to per-4 KiB, and the per-op call chain (~65 us/op
+// measured on the old per-op form) is paid once per group.
+fn aof_write_group(st: &AofState, data: &Vec<u8>) -> bool {
+    if st.enabled != true {
+        return true;
+    };
+    if len(data) == 0 {
+        return true;
+    };
+    if st.broken {
+        return false;
+    };
+    if aof_write_all(st.file, data) != true {
+        st.broken = true;
+        return false;
+    };
+    st.size = st.size + len(data);
+    st.unsynced = st.unsynced + len(data);
+    return true;
+}
+
 // The sync half of a flush: one fdatasync covering everything
 // written so far, with the same bookkeeping aof_flush_pending
 // always did after its sync.
