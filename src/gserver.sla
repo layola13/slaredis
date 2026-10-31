@@ -920,7 +920,7 @@ fn g_aof_step(job: *AofJob) {
                 } else {
                     let group: Vec<*AofOp> = Vec::new();
                     group.push(op);
-                    let install_op = op;
+                    let install_op = group[0];
                     let has_install: bool = false;
                     let any_write: bool = false;
                     let write_failed: bool = false;
