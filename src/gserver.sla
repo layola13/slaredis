@@ -258,13 +258,14 @@ struct ConnJob {
     inbuf: Vec<u8>,
     inoff: u64,
     outbuf: Vec<u8>,
-    // Round-2 inline fallback slot: when the store lock is
-    // contended (the try-lock in g_try_inline missed), the
-    // parsed arguments are cloned into this heap slot so the
-    // blocking lock's park cannot reach the frame's parse
-    // result; the command then executes off the slot, with
-    // every value re-derived from the job pointer after the
-    // park (the heap discipline in the header comment).
+    // Retained but unused since the miss-batch-fallback
+    // reshaping of g_try_inline: this slot held the cloned
+    // arguments for the first inline form's contended path
+    // (park on the blocking lock, execute off the slot). That
+    // shape is gone -- a try-lock miss now rides the batch --
+    // and the field stays only so this reshaping remains
+    // confined to the fallback branch; removing it (and its
+    // constructor initialiser) is a separate cleanup.
     inl_args: Vec<Vec<u8>>,
     authed: bool,
     close_after_flush: bool,
@@ -612,16 +613,26 @@ fn g_inline_eligible(args: &Vec<Vec<u8>>) -> bool {
 //     goroutine with the frame's parse result still live --
 //     the heap discipline forbids reading it after a park.
 //     The command simply joins the batch and the executor
-//     runs it in order.
-// The borrow discipline shapes the two execution paths:
+//     runs it in order, or
+//   - the try-lock missed (contention): miss-batch-fallback
+//     (round-2 step 1, reshaped after the first inline form
+//     failed its A/B gate). The command joins the batch like
+//     the case above; the batch-nonempty head check then
+//     routes every later command of this pass to the batch as
+//     well, so the whole remainder of the pass degrades to
+//     baseline executor behaviour and per-connection order
+//     stays exact. The next pass starts with an empty batch
+//     and retries the inline path. The previous fallback
+//     shape -- clone the arguments into a heap slot and park
+//     on the blocking lock -- serialised contending readers
+//     behind ~25 us FIFO lock handoffs and collapsed
+//     GET P=16 c50 by -75% (step-1 report); no park may
+//     appear in this fallback.
+// The one execution path that remains:
 //   - try-lock acquired: no park has intervened since the
 //     parse, so borrowing pr.args (and threading the out
 //     buffer through the frame) is sound; this is the poll
 //     model's borrow shape plus the lock.
-//   - try-lock missed: the arguments are cloned into the
-//     job's heap slot first; the blocking lock may then park
-//     freely, and the command executes off the slot with all
-//     state re-derived from the job pointer.
 fn g_try_inline(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
     if len((*(*job).req).batch) > 0 {
         return false;
@@ -637,13 +648,7 @@ fn g_try_inline(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
         g_unlock_store(ctx);
         return true;
     };
-    (*job).inl_args = g_clone_args(args);
-    g_lock_store(ctx);
-    let ob2 = (*job).outbuf;
-    (*job).outbuf = exec_command(&(*ctx).store, &(*job).inl_args, now_ms, ob2);
-    g_unlock_store(ctx);
-    (*job).inl_args = Vec::new();
-    return true;
+    return false;
 }
 
 // ---- connection goroutine ----
