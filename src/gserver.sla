@@ -31,10 +31,17 @@
 // bookkeeping exists outside the driver.
 //
 // Redis serial semantics are preserved by construction:
-// every store access runs on the single executor, which
-// takes batches from one FIFO channel, so commands execute
-// atomically one at a time in a definable global order (the
-// executor's receive order). Replies for a batch are
+// write commands run on the single executor, which takes
+// batches from one FIFO channel, so writes execute atomically
+// one at a time in a definable global order (the executor's
+// receive order). Read commands may additionally execute in
+// the connection goroutine under the store mutex (round-2
+// step 1, g_try_inline); the global order is then the
+// interleaving of mutex acquisitions with the executor's
+// batch order, every command still atomic under one of the
+// two serializations, and per-connection order is exact
+// because a read inlines only when that connection has no
+// batch pending. Replies for a batch are
 // produced in batch order and the connection goroutine
 // appends them to its out buffer in that order, interleaved
 // correctly with its locally handled AUTH traffic (a pending
@@ -53,7 +60,7 @@
 //     on AuthConfig and AofState). The sound form, used
 //     everywhere here, is an OWNED VALUE FIELD inside a heap
 //     block, borrowed in place: &(*job).auth_cfg,
-//     &(*job).wst, &(*st).store. Frame locals of a goroutine
+//     &(*job).wst, &(*ctx).store. Frame locals of a goroutine
 //     (values and borrows alike) are likewise not trusted
 //     across a park: all cross-cycle state lives in the job
 //     blocks, re-derived from the job pointer at each use.
@@ -147,6 +154,17 @@ struct SrvCtx {
     auth: *AuthConfig,
     aof_enabled: bool,
     aof_fsync: u8,
+    // The dataset, as an owned value field of this heap block
+    // (the sound borrow shape, &(*ctx).store), and the mutex
+    // that serializes every access to it (round-2 step 1).
+    // The executor used to be the store's only owner; read
+    // commands now also execute in connection goroutines under
+    // this mutex (see g_try_inline). The mutex is held only
+    // around pure store work -- never across a channel
+    // operation (the one send that does hold it arrives in
+    // step 3, with its boundedness argument recorded there).
+    store: Store,
+    store_mu: u64,
     cmd_chan: Chan<*CmdReq>,
     aof_chan: Chan<*AofOp>,
     aof_recycle: Chan<*AofOp>,
@@ -240,6 +258,14 @@ struct ConnJob {
     inbuf: Vec<u8>,
     inoff: u64,
     outbuf: Vec<u8>,
+    // Round-2 inline fallback slot: when the store lock is
+    // contended (the try-lock in g_try_inline missed), the
+    // parsed arguments are cloned into this heap slot so the
+    // blocking lock's park cannot reach the frame's parse
+    // result; the command then executes off the slot, with
+    // every value re-derived from the job pointer after the
+    // park (the heap discipline in the header comment).
+    inl_args: Vec<Vec<u8>>,
     authed: bool,
     close_after_flush: bool,
     yield_ct: u64,
@@ -248,7 +274,6 @@ struct ConnJob {
 
 struct ExecJob {
     ctx: *SrvCtx,
-    store: Store,
 }
 
 struct AofJob {
@@ -322,12 +347,6 @@ struct SupSt {
 // take the pointer so the op pool can be mutated in place).
 struct ExecSt {
     ctx: *SrvCtx,
-    // The store as an owned value field: the executor is its
-    // only owner, and command execution borrows this field
-    // (&(*st).store -- the sound heap-field borrow) instead of
-    // a &(*p) bridge over an externally boxed store (the
-    // unreliable form; see AofJob.wst).
-    store: Store,
     free_ops: Vec<*AofOp>,
     broken: bool,
     since_yield: u64,
@@ -357,6 +376,34 @@ fn g_signal(req: *CmdReq) {
             }
         }
     };
+}
+
+// ---- store mutex (round-2 step 1) ----
+// One mutex serializes the dataset now that connection
+// goroutines execute read commands inline. Holders never park
+// voluntarily inside the lock: the sections are exec_command,
+// store_sweep and dataset_serialize only (pure CPU over the
+// store). The blocking form parks the task (not the carrier)
+// when contended; probe_mutex (line work dir) measured the
+// surface: 39 ns uncontended pair, exact exclusion under
+// 8-way contention, waiters park without freezing unrelated
+// channel traffic.
+
+fn g_lock_store(ctx: *SrvCtx) {
+    let st: i32 = sa_sync_mutex_lock((*ctx).store_mu);
+}
+
+fn g_unlock_store(ctx: *SrvCtx) {
+    let st: i32 = sa_sync_mutex_unlock((*ctx).store_mu);
+}
+
+// Attempt the store lock without parking; true when acquired.
+// The inline fast path borrows the frame's parse result, on
+// which no park may intervene (see g_try_inline).
+fn g_try_lock_store(ctx: *SrvCtx) -> bool {
+    let acq: u32 = 0;
+    let st: i32 = sa_sync_mutex_try_lock((*ctx).store_mu, &acq);
+    return acq != 0;
 }
 
 // ---- AOF op pool (executor side) ----
@@ -532,6 +579,73 @@ fn g_clone_args(args: &Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     return out;
 }
 
+// ---- inline read execution (round-2 step 1: lock + inline
+// reads, the W2 shape) ----
+// A command may execute in the connection goroutine, under the
+// store mutex, when it is neither a journal write nor
+// BGREWRITEAOF. Journal writes stay with the executor: AOF
+// record order must equal the executor's serial execution
+// order, and the group-commit machinery (op pool, pending
+// FIFO) lives there. BGREWRITEAOF stays for its
+// serialize/install dance. Every mutating command in the
+// dispatch table is a journal write (verified against
+// commands.sla's dispatch list), so the inline set below is
+// exactly the read set; anything unrecognized is an
+// exec_command error reply, which is equally safe inline.
+fn g_inline_eligible(args: &Vec<Vec<u8>>) -> bool {
+    if aof_is_rewrite_command(args) {
+        return false;
+    };
+    if journal_is_write(args) {
+        return false;
+    };
+    return true;
+}
+
+// Try to execute one parsed command inline, appending its
+// reply to the connection's out buffer. Returns false when the
+// command must ride the executor batch instead:
+//   - it is not inline-eligible (see above), or
+//   - a batch is already pending for this connection: the
+//     batch must execute first (per-connection command order
+//     is a wire contract), and flushing it would park this
+//     goroutine with the frame's parse result still live --
+//     the heap discipline forbids reading it after a park.
+//     The command simply joins the batch and the executor
+//     runs it in order.
+// The borrow discipline shapes the two execution paths:
+//   - try-lock acquired: no park has intervened since the
+//     parse, so borrowing pr.args (and threading the out
+//     buffer through the frame) is sound; this is the poll
+//     model's borrow shape plus the lock.
+//   - try-lock missed: the arguments are cloned into the
+//     job's heap slot first; the blocking lock may then park
+//     freely, and the command executes off the slot with all
+//     state re-derived from the job pointer.
+fn g_try_inline(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
+    if len((*(*job).req).batch) > 0 {
+        return false;
+    };
+    if g_inline_eligible(args) != true {
+        return false;
+    };
+    let ctx = (*job).ctx;
+    let now_ms: i64 = sa_time_unix_ms();
+    if g_try_lock_store(ctx) {
+        let ob = (*job).outbuf;
+        (*job).outbuf = exec_command(&(*ctx).store, args, now_ms, ob);
+        g_unlock_store(ctx);
+        return true;
+    };
+    (*job).inl_args = g_clone_args(args);
+    g_lock_store(ctx);
+    let ob2 = (*job).outbuf;
+    (*job).outbuf = exec_command(&(*ctx).store, &(*job).inl_args, now_ms, ob2);
+    g_unlock_store(ctx);
+    (*job).inl_args = Vec::new();
+    return true;
+}
+
 // ---- connection goroutine ----
 
 // Send the connection's pending batch to the executor, wait
@@ -667,7 +781,9 @@ fn g_conn_step(job: *ConnJob) -> bool {
                             (*job).auth_ok_pending = false;
                         };
                     } else {
-                        (*(*job).req).batch.push(g_clone_args(&pr.args));
+                        if g_try_inline(job, &pr.args) != true {
+                            (*(*job).req).batch.push(g_clone_args(&pr.args));
+                        };
                     };
                 };
                 let ye = (*(*job).ctx).yield_every;
@@ -749,7 +865,9 @@ fn g_exec_batch(st: *ExecSt, req: *CmdReq) -> bool {
                         (*st).cur_chunks = Vec::new();
                         let okc = g_aof_append(st, chc);
                     };
-                    let data = dataset_serialize(&(*st).store, now_ms, Vec::new());
+                    g_lock_store(ctx);
+                    let data = dataset_serialize(&(*ctx).store, now_ms, Vec::new());
+                    g_unlock_store(ctx);
                     if g_aof_install(st, data, true) {
                         (*req).replies.push(resp_simple(Vec::new(), STR_PTR("AOF rewrite completed"), STR_LEN("AOF rewrite completed")));
                     } else {
@@ -767,7 +885,8 @@ fn g_exec_batch(st: *ExecSt, req: *CmdReq) -> bool {
             if is_write && (*st).broken {
                 (*req).replies.push(resp_error(Vec::new(), STR_PTR("ERR AOF write failed: persistence is broken, writes are refused"), STR_LEN("ERR AOF write failed: persistence is broken, writes are refused")));
             } else {
-                let rep = exec_command(&(*st).store, &(*st).cur_batch[bi], now_ms, Vec::new());
+                g_lock_store(ctx);
+                let rep = exec_command(&(*ctx).store, &(*st).cur_batch[bi], now_ms, Vec::new());
                 if is_write {
                     if len(rep) > 0 {
                         if rep[0] != 45 {
@@ -775,6 +894,7 @@ fn g_exec_batch(st: *ExecSt, req: *CmdReq) -> bool {
                         };
                     };
                 };
+                g_unlock_store(ctx);
                 (*req).replies.push(rep);
             };
         };
@@ -807,7 +927,7 @@ fn g_exec_batch(st: *ExecSt, req: *CmdReq) -> bool {
 
 fn g_exec_main(job: *ExecJob) {
     let ctx = (*job).ctx;
-    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, store: (*job).store, free_ops: Vec::new(), broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new(), pend_reqs: Vec::new(), pend_ops: Vec::new() }));
+    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, free_ops: Vec::new(), broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new(), pend_reqs: Vec::new(), pend_ops: Vec::new() }));
     // The op pool is sized for group commit: under fsync=always
     // many batches' appends are in flight at once (one per
     // pending batch), where the synchronous form needed one.
@@ -830,7 +950,9 @@ fn g_exec_main(job: *ExecJob) {
 fn g_exec_handle(st: *ExecSt, req: *CmdReq) {
         let ctx = (*st).ctx;
         if (*req).kind == CMD_SWEEP {
-            let swept: u64 = store_sweep(&(*st).store, sa_time_unix_ms());
+            g_lock_store(ctx);
+            let swept: u64 = store_sweep(&(*ctx).store, sa_time_unix_ms());
+            g_unlock_store(ctx);
             g_signal(req);
         } else {
             if (*req).kind == CMD_SERIALIZE {
@@ -842,7 +964,9 @@ fn g_exec_handle(st: *ExecSt, req: *CmdReq) {
                 // reflect commands the snapshot already
                 // includes... and appends sent after it carry
                 // post-snapshot records into the new file.
-                let data = dataset_serialize(&(*st).store, sa_time_unix_ms(), Vec::new());
+                g_lock_store(ctx);
+                let data = dataset_serialize(&(*ctx).store, sa_time_unix_ms(), Vec::new());
+                g_unlock_store(ctx);
                 let oki = g_aof_install(st, data, false);
                 g_signal(req);
             } else {
@@ -1308,7 +1432,7 @@ fn g_io_accept(st: *IoSt) {
             };
             let dchan: Chan<u64> = Chan::new(0);
             let req = Box::into_raw(Box::new(CmdReq { kind: CMD_BATCH, ack: true, batch: Vec::new(), replies: Vec::new(), done: dchan }));
-            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outbuf: Vec::new(), authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
+            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outbuf: Vec::new(), inl_args: Vec::new(), authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
             let gh = go g_conn_main(cj);
             (*ctx).sup_reg.send((gh, h));
             accepts = accepts + 1;
@@ -1547,10 +1671,20 @@ fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig
     let sup_reg: Chan<(u64, u64)> = Chan::new(256);
     let io_out: Chan<*IoOut> = Chan::new(256);
     let authp = Box::into_raw(Box::new(auth));
+    // The store mutex (round-2 step 1): created before the
+    // context exists; a creation failure is a setup failure,
+    // reported with the setup exit family (67).
+    let store_mu: u64 = 0;
+    let mst: i32 = sa_sync_mutex_new(&store_mu);
+    if mst != 0 {
+        return 67;
+    };
     let ctx = Box::into_raw(Box::new(SrvCtx {
         auth: authp,
         aof_enabled: aof_enabled_v,
         aof_fsync: aof_fsync_v,
+        store: store,
+        store_mu: store_mu,
         cmd_chan: cmd_chan,
         aof_chan: aof_chan,
         aof_recycle: aof_recycle,
@@ -1563,7 +1697,7 @@ fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig
     }));
     // Spawn order: consumers first, the IO driver last, so no
     // connection can be accepted before its executor exists.
-    let ej = Box::into_raw(Box::new(ExecJob { ctx: ctx, store: store }));
+    let ej = Box::into_raw(Box::new(ExecJob { ctx: ctx }));
     let h_exec = go g_exec_main(ej);
     let m_exec = monitor(h_exec);
     let m_aof: Chan<(u64, i32)> = Chan::new(0);
