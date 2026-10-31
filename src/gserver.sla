@@ -336,6 +336,14 @@ struct ExecSt {
     // goroutine mid-batch (see ConnJob's note on frame values).
     cur_batch: Vec<Vec<Vec<u8>>>,
     cur_chunks: Vec<Vec<u8>>,
+    // Group commit (fsync=always): batches whose append op has
+    // been sent but whose covering sync has not landed yet. The
+    // done signal for pend_reqs[i] is released by
+    // g_recycle_handle when pend_ops[i] is recycled. FIFO: ops
+    // are sent in batch order and the writer recycles in the
+    // order it processes, so completions arrive head-first.
+    pend_reqs: Vec<*CmdReq>,
+    pend_ops: Vec<*AofOp>,
 }
 
 fn g_signal(req: *CmdReq) {
@@ -353,12 +361,44 @@ fn g_signal(req: *CmdReq) {
 
 // ---- AOF op pool (executor side) ----
 
+// One recycled op, from whichever consumer met it first: if it
+// is the head pending (group-commit) op, its batch's done signal
+// is released now -- the covering sync has landed -- and a
+// failure marks the executor broken for subsequent batches,
+// exactly as the synchronous g_op_wait result used to. Either
+// way the op returns to the free pool.
+fn g_recycle_handle(st: *ExecSt, op: *AofOp) {
+    if len((*st).pend_ops) > 0 {
+        if (*(*st).pend_ops[0]).idx == (*op).idx {
+            let req = (*st).pend_reqs[0];
+            let ok = (*op).result;
+            let nr: Vec<*CmdReq> = Vec::new();
+            let no: Vec<*AofOp> = Vec::new();
+            let i: u64 = 1;
+            while i < len((*st).pend_reqs) {
+                nr.push((*st).pend_reqs[i]);
+                no.push((*st).pend_ops[i]);
+                i = i + 1;
+            }
+            (*st).pend_reqs = nr;
+            (*st).pend_ops = no;
+            if ok != true {
+                (*st).broken = true;
+            };
+            (*st).free_ops.push(op);
+            g_signal(req);
+            return;
+        };
+    };
+    (*st).free_ops.push(op);
+}
+
 fn g_op_drain(st: *ExecSt) {
     let draining: bool = true;
     while draining {
         select {
             case let op = (*(*st).ctx).aof_recycle.recv() {
-                (*st).free_ops.push(op);
+                g_recycle_handle(st, op);
             }
             default {
                 draining = false;
@@ -370,8 +410,12 @@ fn g_op_drain(st: *ExecSt) {
 fn g_op_take(st: *ExecSt) -> *AofOp {
     g_op_drain(st);
     while len((*st).free_ops) == 0 {
-        let (op2, cl2) = (*(*st).ctx).aof_recycle.recv();
-        (*st).free_ops.push(op2);
+        // The pool can only be empty with appends in flight
+        // (group commit pipelines them); the writer recycles
+        // independently, so yield + drain until one lands.
+        // Recycles consumed here complete pending batches via
+        // g_recycle_handle, as everywhere else.
+        let yst: i32 = sa_task_yield();
         g_op_drain(st);
     }
     let n: u64 = len((*st).free_ops);
@@ -388,7 +432,8 @@ fn g_op_take(st: *ExecSt) -> *AofOp {
 }
 
 // Wait until the writer recycles this exact op; returns its
-// result. Recycles of other ops go back to the free list.
+// result. Recycles of other ops go through g_recycle_handle
+// (they may complete pending group-commit batches).
 fn g_op_wait(st: *ExecSt, mine: *AofOp) -> bool {
     let waiting: bool = true;
     let res: bool = false;
@@ -399,7 +444,7 @@ fn g_op_wait(st: *ExecSt, mine: *AofOp) -> bool {
             (*st).free_ops.push(op);
             waiting = false;
         } else {
-            (*st).free_ops.push(op);
+            g_recycle_handle(st, op);
         };
     }
     return res;
@@ -427,6 +472,27 @@ fn g_aof_append(st: *ExecSt, chunks: Vec<Vec<u8>>) -> bool {
         return ok;
     };
     return true;
+}
+
+// Group-commit form of g_aof_append (fsync=always only): the
+// op is dispatched and the batch is parked on the pending FIFO;
+// its done signal is released by g_recycle_handle once the
+// writer's group sync covering these records lands. The
+// executor meanwhile executes later batches, so the records of
+// many batches accumulate in the writer's queue and one sync
+// covers them all. The durability point is unchanged: no reply
+// of this batch is released before a sync covering its records
+// completes -- only the waiting is pipelined.
+fn g_aof_append_defer(st: *ExecSt, chunks: Vec<Vec<u8>>, req: *CmdReq) {
+    let ctx = (*st).ctx;
+    let op = g_op_take(st);
+    (*op).kind = AOF_OP_APPEND;
+    (*op).chunks = chunks;
+    (*op).data = Vec::new();
+    (*op).result = false;
+    (*ctx).aof_chan.send(op);
+    (*st).pend_reqs.push(req);
+    (*st).pend_ops.push(op);
 }
 
 // Dispatch one install op carrying a serialized dataset. The
@@ -648,7 +714,10 @@ fn g_conn_step(job: *ConnJob) -> bool {
 // journal hook -- with records staged per batch and dispatched
 // to the AOF writer once, before the batch is signalled done,
 // so a reply never precedes its record's handoff.
-fn g_exec_batch(st: *ExecSt, req: *CmdReq) {
+// Execute one batch; returns true when its done signal was
+// deferred to the group-commit pending FIFO (fsync=always with
+// journal records staged), false when the caller signals now.
+fn g_exec_batch(st: *ExecSt, req: *CmdReq) -> bool {
     let ctx = (*st).ctx;
     if (*ctx).aof_broken {
         (*st).broken = true;
@@ -721,16 +790,29 @@ fn g_exec_batch(st: *ExecSt, req: *CmdReq) {
     if len((*st).cur_chunks) > 0 {
         let chc2 = (*st).cur_chunks;
         (*st).cur_chunks = Vec::new();
+        if (*ctx).aof_fsync == AOF_FSYNC_ALWAYS {
+            // Group commit: defer this batch's done signal
+            // until the covering sync lands (see
+            // g_aof_append_defer); the caller (g_exec_handle)
+            // must not signal.
+            g_aof_append_defer(st, chc2, req);
+            (*st).cur_batch = Vec::new();
+            return true;
+        };
         let okf = g_aof_append(st, chc2);
     };
     (*st).cur_batch = Vec::new();
+    return false;
 }
 
 fn g_exec_main(job: *ExecJob) {
     let ctx = (*job).ctx;
-    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, store: (*job).store, free_ops: Vec::new(), broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new() }));
+    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, store: (*job).store, free_ops: Vec::new(), broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new(), pend_reqs: Vec::new(), pend_ops: Vec::new() }));
+    // The op pool is sized for group commit: under fsync=always
+    // many batches' appends are in flight at once (one per
+    // pending batch), where the synchronous form needed one.
     let pi: u64 = 0;
-    while pi < 8 {
+    while pi < 256 {
         let op = Box::into_raw(Box::new(AofOp { kind: AOF_OP_APPEND, idx: pi, chunks: Vec::new(), data: Vec::new(), result: false }));
         (*st).free_ops.push(op);
         pi = pi + 1;
@@ -742,11 +824,11 @@ fn g_exec_main(job: *ExecJob) {
     }
 }
 
-// One executor cycle: take one request off the command
-// channel and dispatch it (sweep / serialize / batch).
-fn g_exec_step(st: *ExecSt) {
+// Dispatch one request taken off the command channel (sweep /
+// serialize / batch). A batch whose done signal was deferred
+// (group commit) is signalled later by g_recycle_handle.
+fn g_exec_handle(st: *ExecSt, req: *CmdReq) {
         let ctx = (*st).ctx;
-        let (req, cl) = (*ctx).cmd_chan.recv();
         if (*req).kind == CMD_SWEEP {
             let swept: u64 = store_sweep(&(*st).store, sa_time_unix_ms());
             g_signal(req);
@@ -764,9 +846,35 @@ fn g_exec_step(st: *ExecSt) {
                 let oki = g_aof_install(st, data, false);
                 g_signal(req);
             } else {
-                g_exec_batch(st, req);
-                g_signal(req);
+                let deferred = g_exec_batch(st, req);
+                if deferred != true {
+                    g_signal(req);
+                };
             };
+        };
+}
+
+// One executor cycle: take one request off the command
+// channel and dispatch it (sweep / serialize / batch). While
+// group-commit batches are pending, the cycle also listens on
+// the recycle channel: a pending batch completes there. (With
+// nothing pending the cycle is the historical blocking recv --
+// the recycle channel is drained opportunistically by
+// g_op_take / g_op_drain on the paths that need ops.)
+fn g_exec_step(st: *ExecSt) {
+        let ctx = (*st).ctx;
+        if len((*st).pend_ops) == 0 {
+            let (req, cl) = (*ctx).cmd_chan.recv();
+            g_exec_handle(st, req);
+        } else {
+            select {
+                case let req = (*ctx).cmd_chan.recv() {
+                    g_exec_handle(st, req);
+                }
+                case let op = (*ctx).aof_recycle.recv() {
+                    g_recycle_handle(st, op);
+                }
+            }
         };
 }
 
@@ -787,34 +895,117 @@ fn g_aof_main(job: *AofJob) {
 }
 
 // One writer cycle: one op off the AOF channel, or the
-// 100 ms tick (everysec sync + auto-rewrite trigger).
+// 100 ms tick (everysec sync + auto-rewrite trigger). An
+// append op takes any further appends already queued with it
+// (group commit): each op's chunks are written in channel
+// order, then under fsync=always ONE sync covers the group.
+// An install op stops the group: the grouped appends flush
+// (and sync) first, then the install runs, preserving the
+// FIFO ordering argument end to end.
 fn g_aof_step(job: *AofJob) {
         let ctx = (*job).ctx;
         select {
             case let op = (*ctx).aof_chan.recv() {
-                if (*op).kind == AOF_OP_APPEND {
-                    if (*job).wst.broken {
-                        (*op).result = false;
-                    } else {
-                        // pending is empty between ops by
-                        // construction: aof_flush_pending
-                        // consumes it whole on every call.
-                        (*job).wst.pending = (*op).chunks;
-                        (*op).chunks = Vec::new();
-                        (*op).result = aof_flush_pending(&(*job).wst, sa_time_unix_ms());
-                    };
-                } else {
+                if (*op).kind == AOF_OP_INSTALL {
                     if (*job).wst.broken {
                         (*op).result = false;
                     } else {
                         (*op).result = aof_swap_in(&(*job).wst, &(*op).data, sa_time_unix_ms());
                     };
                     (*job).rw_out = false;
+                    if (*job).wst.broken {
+                        (*ctx).aof_broken = true;
+                    };
+                    (*ctx).aof_recycle.send(op);
+                } else {
+                    let group: Vec<*AofOp> = Vec::new();
+                    group.push(op);
+                    let install_op = op;
+                    let has_install: bool = false;
+                    let any_write: bool = false;
+                    let write_failed: bool = false;
+                    // Write the first op, then keep draining
+                    // appends that are already queued.
+                    let gi: u64 = 0;
+                    let draining: bool = true;
+                    while draining {
+                        let gop = group[gi];
+                        if (*job).wst.broken {
+                            (*gop).result = false;
+                            write_failed = true;
+                        } else {
+                            (*job).wst.pending = (*gop).chunks;
+                            (*gop).chunks = Vec::new();
+                            let wok = aof_flush_write(&(*job).wst, sa_time_unix_ms());
+                            (*gop).result = wok;
+                            if wok {
+                                any_write = true;
+                            } else {
+                                write_failed = true;
+                            };
+                        };
+                        gi = gi + 1;
+                        if gi < len(group) {
+                            // more already collected
+                        } else {
+                            if len(group) >= 256 {
+                                draining = false;
+                            } else {
+                                select {
+                                    case let op2 = (*ctx).aof_chan.recv() {
+                                        if (*op2).kind == AOF_OP_INSTALL {
+                                            install_op = op2;
+                                            has_install = true;
+                                            draining = false;
+                                        } else {
+                                            group.push(op2);
+                                        };
+                                    }
+                                    default {
+                                        draining = false;
+                                    }
+                                }
+                            };
+                        };
+                    }
+                    if (*ctx).aof_fsync == AOF_FSYNC_ALWAYS {
+                        if any_write && write_failed != true {
+                            let sok = aof_sync_now(&(*job).wst, sa_time_unix_ms());
+                            if sok != true {
+                                write_failed = true;
+                            };
+                        };
+                        if write_failed {
+                            let fi: u64 = 0;
+                            while fi < len(group) {
+                                let fop = group[fi];
+                                (*fop).result = false;
+                                fi = fi + 1;
+                            }
+                        };
+                    };
+                    if (*job).wst.broken {
+                        (*ctx).aof_broken = true;
+                    };
+                    let ri: u64 = 0;
+                    while ri < len(group) {
+                        let rop = group[ri];
+                        (*ctx).aof_recycle.send(rop);
+                        ri = ri + 1;
+                    }
+                    if has_install {
+                        if (*job).wst.broken {
+                            (*install_op).result = false;
+                        } else {
+                            (*install_op).result = aof_swap_in(&(*job).wst, &(*install_op).data, sa_time_unix_ms());
+                        };
+                        (*job).rw_out = false;
+                        if (*job).wst.broken {
+                            (*ctx).aof_broken = true;
+                        };
+                        (*ctx).aof_recycle.send(install_op);
+                    };
                 };
-                if (*job).wst.broken {
-                    (*ctx).aof_broken = true;
-                };
-                (*ctx).aof_recycle.send(op);
             }
             timeout(100000000) {
                 let now_ms: i64 = sa_time_unix_ms();

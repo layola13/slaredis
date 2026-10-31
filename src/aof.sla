@@ -189,6 +189,26 @@ fn aof_open(st: &AofState) -> bool {
 // refuses further writes with an explicit error (see
 // server.sla) instead of silently continuing unpersisted.
 fn aof_flush_pending(st: &AofState, now_ms: i64) -> bool {
+    if aof_flush_write(st, now_ms) != true {
+        return false;
+    };
+    if st.fsync_mode == AOF_FSYNC_ALWAYS {
+        if st.unsynced > 0 {
+            return aof_sync_now(st, now_ms);
+        };
+    };
+    return true;
+}
+
+// aof_flush_pending split in two (2026-10-31, group commit): the
+// write half. Writes every staged chunk and does the size /
+// unsynced accounting, but never syncs. The goroutine AOF writer
+// runs this once per append op in a drained group and then pays
+// ONE aof_sync_now for the whole group under fsync=always --
+// Redis's group commit: at -P 1 with many clients, one host sync
+// (~5 ms on this VM) covers every batch that executed while it
+// was in flight, instead of one sync per batch.
+fn aof_flush_write(st: &AofState, now_ms: i64) -> bool {
     if st.enabled != true {
         return true;
     };
@@ -212,15 +232,26 @@ fn aof_flush_pending(st: &AofState, now_ms: i64) -> bool {
     }
     st.size = st.size + total;
     st.unsynced = st.unsynced + total;
-    if st.fsync_mode == AOF_FSYNC_ALWAYS {
-        let sst: i32 = sa_fs_file_sync_data(st.file);
-        if sst != SA_STD_OK {
-            st.broken = true;
-            return false;
-        };
-        st.unsynced = 0;
-        st.last_sync_ms = now_ms;
+    return true;
+}
+
+// The sync half of a flush: one fdatasync covering everything
+// written so far, with the same bookkeeping aof_flush_pending
+// always did after its sync.
+fn aof_sync_now(st: &AofState, now_ms: i64) -> bool {
+    if st.enabled != true {
+        return true;
     };
+    if st.broken {
+        return false;
+    };
+    let sst: i32 = sa_fs_file_sync_data(st.file);
+    if sst != SA_STD_OK {
+        st.broken = true;
+        return false;
+    };
+    st.unsynced = 0;
+    st.last_sync_ms = now_ms;
     return true;
 }
 
