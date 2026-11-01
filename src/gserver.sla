@@ -422,6 +422,18 @@ struct DriverConn {
     outq: Vec<Vec<u8>>,
     out_idx: u64,
     out_off: u64,
+    // The write staging buffer (OUT_STAGE_CAP bytes), owned
+    // by the connection and zero-filled ONCE at construction
+    // (step-4 triage): g_io_write gathers into it in place.
+    // The pre-triage shape declared the staging as a stack
+    // local inside g_io_write, and on this toolchain a stack
+    // array literal is re-filled on every declaration -- one
+    // full-capacity byte pass per write call, a fixed
+    // ~30 us/op on small replies (measured; see REPORT
+    // step-4 triage section). Only the first `filled` bytes
+    // are ever handed to the socket, so the fill's only job
+    // was initialization, never content.
+    stage: [u8; 8192],
     ready: u32,
     read_closed: bool,
     eof_sent: bool,
@@ -1888,7 +1900,7 @@ fn g_io_accept(st: *IoSt) {
             accepts = accepts + 1;
         } else {
             let inbox: Chan<*IoMsg> = Chan::new(16);
-            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_idx: 0, out_off: 0, ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false }));
+            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false }));
             if (*st).n < 8192 {
                 (*st).slots[(*st).n] = dc;
                 (*st).n = (*st).n + 1;
@@ -1966,8 +1978,7 @@ fn g_io_write(st: *IoSt, dc: *DriverConn) {
     if g_out_pending(dc) != true {
         return;
     };
-    let arr: [u8; 8192] = [0u8; 8192];
-    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    let ap: ptr = PTR_BYTE_ADD(&((*dc).stage), 0);
     let filled: u64 = 0;
     let lidx: u64 = (*dc).out_idx;
     let loff: u64 = (*dc).out_off;
@@ -1993,7 +2004,7 @@ fn g_io_write(st: *IoSt, dc: *DriverConn) {
             // no raw segment pointer ever reaches an extern).
             let j: u64 = 0;
             while j < take {
-                arr[filled + j] = seg[loff + j];
+                (*dc).stage[filled + j] = seg[loff + j];
                 j = j + 1;
             }
             filled = filled + take;
@@ -2027,7 +2038,7 @@ fn g_io_write(st: *IoSt, dc: *DriverConn) {
 fn g_io_run(job: *IoJob) -> i32 {
     let ctx = (*job).ctx;
     let dummy_inbox: Chan<*IoMsg> = Chan::new(1);
-    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_idx: 0, out_off: 0, ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true }));
+    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true }));
     let st = Box::into_raw(Box::new(IoSt { ctx: ctx, listener: (*job).listener, wake_rx: (*job).wake_rx, slots: [sentinel; 8192], n: 0, lis_ready: 0, wake_ready: 0, any_dead: false }));
     while (*ctx).core_dead != true {
         g_io_drain_out(st);
