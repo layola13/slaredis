@@ -42,9 +42,10 @@
 // whole -- so per-connection order stays exact), the sweeps,
 // the serializations, and BGREWRITEAOF's dance. Replies are
 // produced in command order and the connection goroutine
-// appends them to its out buffer in that order, interleaved
-// correctly with its locally handled AUTH traffic (a pending
-// batch is always flushed before a local AUTH step runs).
+// collects them into its out segment list in that order,
+// interleaved correctly with its locally handled AUTH
+// traffic (a pending batch is always flushed before a local
+// AUTH step runs).
 // AOF record order equals execution order by construction:
 // an inline write sends its append op on aof_chan while
 // still holding the store mutex, so op sends serialize in
@@ -166,6 +167,17 @@ const G_EXIT_CORE_DEAD: i32 = 71;
 // per-connection op holdings; see g_inline_wait).
 const INL_WAIT_CAP: u64 = 64;
 
+// Out staging capacity (round-2 step 4, DESIGN (c)): the IO
+// driver gathers queued reply segments into one staging
+// buffer of this size per write attempt, straight from the
+// segment cursor -- segments are never concatenated into a
+// flat queue. The capacity doubles as the small-total merge
+// threshold: a flush whose total pending bytes fit under it
+// leaves in exactly one write call, however many segments it
+// spans (the DESIGN (c) <=8 KiB figure, adopted as the gather
+// capacity; see g_io_write).
+const OUT_STAGE_CAP: u64 = 8192;
+
 struct SrvCtx {
     auth: *AuthConfig,
     aof_enabled: bool,
@@ -280,14 +292,17 @@ struct IoMsg {
 }
 
 // Connection goroutine -> IO driver, on the shared io_out
-// channel: reply bytes to append to the connection's out
-// queue, or a close request (IO_OUT_CLOSE_AFTER_FLUSH: close
-// once the queue has drained; IO_OUT_CLOSE_NOW: close at
-// once, used by the supervisor for trapped connections).
+// channel: the pass's reply segments (round-2 step 4, DESIGN
+// (c): one Vec per reply, ownership moving to the driver's
+// out queue unmodified -- never borrowed, so a connection's
+// teardown can never dangle into queued bytes), or a close
+// request (IO_OUT_CLOSE_AFTER_FLUSH: close once the queue
+// has drained; IO_OUT_CLOSE_NOW: close at once, used by the
+// supervisor for trapped connections).
 struct IoOut {
     fd: u64,
     kind: u8,
-    bytes: Vec<u8>,
+    parts: Vec<Vec<u8>>,
 }
 
 struct ConnJob {
@@ -316,7 +331,12 @@ struct ConnJob {
     // every working goroutine program in this stack uses.
     inbuf: Vec<u8>,
     inoff: u64,
-    outbuf: Vec<u8>,
+    // This pass's reply segments, in command order (round-2
+    // step 4, DESIGN (c)): every reply is produced into its
+    // own Vec and pushed here whole -- the pre-(c) shape
+    // concatenated every reply into one flat out buffer,
+    // a full extra copy per reply on the batch path.
+    outsegs: Vec<Vec<u8>>,
     // Retained but unused since the miss-batch-fallback
     // reshaping of g_try_inline: this slot held the cloned
     // arguments for the first inline form's contended path
@@ -391,7 +411,16 @@ struct IoJob {
 struct DriverConn {
     fd: u64,
     inbox: Chan<*IoMsg>,
-    outq: Vec<u8>,
+    // The out queue as a list of reply segments (round-2
+    // step 4, DESIGN (c)) with a (out_idx, out_off) cursor:
+    // outq[out_idx] is the segment being written, out_off
+    // the byte offset already accepted by the socket inside
+    // it. Segments before the cursor are fully written. The
+    // cursor only ever moves forward by exactly the byte
+    // count a write call accepted, so a partial write resumes
+    // byte-exactly, across as many rounds as it takes.
+    outq: Vec<Vec<u8>>,
+    out_idx: u64,
     out_off: u64,
     ready: u32,
     read_closed: bool,
@@ -835,9 +864,9 @@ fn g_try_inline(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
     let ctx = (*job).ctx;
     let now_ms: i64 = sa_time_unix_ms();
     if g_try_lock_store(ctx) {
-        let ob = (*job).outbuf;
-        (*job).outbuf = exec_command(&(*ctx).store, args, now_ms, ob);
+        let seg = exec_command(&(*ctx).store, args, now_ms, Vec::new());
         g_unlock_store(ctx);
+        g_seg_push(job, seg);
         return true;
     };
     return false;
@@ -858,9 +887,9 @@ fn g_try_inline_write(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
         // vacuous with no AOF), same try-lock discipline.
         let now_ms: i64 = sa_time_unix_ms();
         if g_try_lock_store(ctx) {
-            let ob = (*job).outbuf;
-            (*job).outbuf = exec_command(&(*ctx).store, args, now_ms, ob);
+            let seg = exec_command(&(*ctx).store, args, now_ms, Vec::new());
             g_unlock_store(ctx);
+            g_seg_push(job, seg);
             return true;
         };
         return false;
@@ -870,8 +899,8 @@ fn g_try_inline_write(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
         // refusal touches no store state, so it needs no
         // lock; answering inline keeps the pass's reply order
         // exact and costs the failing connection no batch).
-        let obe = (*job).outbuf;
-        (*job).outbuf = resp_error(obe, STR_PTR("ERR AOF write failed: persistence is broken, writes are refused"), STR_LEN("ERR AOF write failed: persistence is broken, writes are refused"));
+        let seg = resp_error(Vec::new(), STR_PTR("ERR AOF write failed: persistence is broken, writes are refused"), STR_LEN("ERR AOF write failed: persistence is broken, writes are refused"));
+        g_seg_push(job, seg);
         return true;
     };
     // The op is taken BEFORE the store lock: every
@@ -918,8 +947,10 @@ fn g_try_inline_write(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
         (*ctx).aof_chan.send(op);
     };
     g_unlock_store(ctx);
-    let ob2 = (*job).outbuf;
-    (*job).outbuf = bytes_push_range(ob2, &rep, 0, len(rep));
+    // The reply was produced into its own Vec above (the
+    // record-staging read of rep[0] needed it separate); it
+    // joins the segment list whole, no copy (step 4).
+    g_seg_push(job, rep);
     if is_err {
         g_pool_give(ctx, op);
         return true;
@@ -967,9 +998,26 @@ fn g_inline_wait(job: *ConnJob) {
 
 // ---- connection goroutine ----
 
+// Append one reply segment to the connection's out list
+// (round-2 step 4, DESIGN (c)). Every reply in this model is
+// produced into its own Vec; the segment joins the list by
+// ownership move, in command order. An empty segment carries
+// no bytes and is dropped here, which keeps the driver's
+// cursor invariant (a queued segment always has bytes) free
+// of special cases.
+fn g_seg_push(job: *ConnJob, seg: Vec<u8>) {
+    if len(seg) == 0 {
+        return;
+    };
+    (*job).outsegs.push(seg);
+}
+
 // Send the connection's pending batch to the executor, wait
-// for completion, and append the replies to its out buffer in
-// order. The batch/reply vectors are reset for the next pass.
+// for completion, and move the replies into the out segment
+// list in order (step 4: the executor's per-command reply
+// Vecs move as-is; the pre-(c) shape copied every one of
+// them into the flat out buffer). The batch/reply vectors
+// are reset for the next pass.
 fn g_flush_batch(job: *ConnJob) {
     let ctx = (*job).ctx;
     let req = (*job).req;
@@ -980,14 +1028,13 @@ fn g_flush_batch(job: *ConnJob) {
     (*req).ack = true;
     (*ctx).cmd_chan.send(req);
     let (dv, dcl) = (*req).done.recv();
-    let ri: u64 = 0;
-    while ri < len((*req).replies) {
-        let ob = (*job).outbuf;
-        (*job).outbuf = bytes_push_range(ob, &(*req).replies[ri], 0, len((*req).replies[ri]));
-        ri = ri + 1;
+    let reps = (*req).replies;
+    (*req).replies = Vec::new();
+    while len(reps) > 0 {
+        let r = reps.remove(0);
+        g_seg_push(job, r);
     }
     (*req).batch = Vec::new();
-    (*req).replies = Vec::new();
 }
 
 // Poke the IO driver's wake socket: one byte on a loopback
@@ -1004,22 +1051,26 @@ fn g_poke(ctx: *SrvCtx) {
     let st: i32 = sa_std_net_tcp_stream_write((*ctx).wake_tx, op, 1, &written);
 }
 
-// Hand the connection's accumulated reply bytes to the IO
-// driver (and wake it). Order on the io_out channel is the
-// wire order: bytes always precede a close request sent later.
+// Hand the connection's accumulated reply segments to the
+// IO driver (and wake it). The segment list moves into the
+// message whole (step 4): no concatenation happens here or
+// in the driver; small totals are still written as one call
+// because the driver's gather capacity covers them (see
+// OUT_STAGE_CAP). Order on the io_out channel is the wire
+// order: segments always precede a close request sent later.
 fn g_emit(job: *ConnJob) {
-    if len((*job).outbuf) == 0 {
+    if len((*job).outsegs) == 0 {
         return;
     };
-    let bytes = (*job).outbuf;
-    (*job).outbuf = Vec::new();
-    let m = Box::into_raw(Box::new(IoOut { fd: (*job).stream, kind: IO_OUT_BYTES, bytes: bytes }));
+    let parts = (*job).outsegs;
+    (*job).outsegs = Vec::new();
+    let m = Box::into_raw(Box::new(IoOut { fd: (*job).stream, kind: IO_OUT_BYTES, parts: parts }));
     (*(*job).ctx).io_out.send(m);
     g_poke((*job).ctx);
 }
 
 fn g_close_ctl(job: *ConnJob, kind: u8) {
-    let m = Box::into_raw(Box::new(IoOut { fd: (*job).stream, kind: kind, bytes: Vec::new() }));
+    let m = Box::into_raw(Box::new(IoOut { fd: (*job).stream, kind: kind, parts: Vec::new() }));
     (*(*job).ctx).io_out.send(m);
     g_poke((*job).ctx);
 }
@@ -1076,8 +1127,8 @@ fn g_conn_step(job: *ConnJob) -> bool {
                 // Replies of commands executed before the bad
                 // bytes precede the error, as in the poll loop.
                 g_flush_batch(job);
-                let obe = (*job).outbuf;
-                (*job).outbuf = resp_error(obe, STR_PTR("ERR Protocol error"), STR_LEN("ERR Protocol error"));
+                let seg = resp_error(Vec::new(), STR_PTR("ERR Protocol error"), STR_LEN("ERR Protocol error"));
+                g_seg_push(job, seg);
                 (*job).close_after_flush = true;
                 (*job).inoff = len((*job).inbuf);
                 break;
@@ -1086,15 +1137,14 @@ fn g_conn_step(job: *ConnJob) -> bool {
             if pr.state == PARSE_OK {
                 if auth_gate_allows(&(*job).auth_cfg, (*job).authed, &pr.args) != true {
                     g_flush_batch(job);
-                    let obn = (*job).outbuf;
-                    (*job).outbuf = resp_error(obn, STR_PTR("NOAUTH Authentication required."), STR_LEN("NOAUTH Authentication required."));
+                    let seg = resp_error(Vec::new(), STR_PTR("NOAUTH Authentication required."), STR_LEN("NOAUTH Authentication required."));
+                    g_seg_push(job, seg);
                 } else {
                     if auth_is_auth_command(&pr.args) {
                         let arep = cmd_auth(&(*job).auth_cfg, &pr.args, Vec::new());
                         (*job).auth_ok_pending = auth_attempt_succeeds(&(*job).auth_cfg, &pr.args);
                         g_flush_batch(job);
-                        let ob2 = (*job).outbuf;
-                        (*job).outbuf = bytes_push_range(ob2, &arep, 0, len(arep));
+                        g_seg_push(job, arep);
                         if (*job).auth_ok_pending {
                             (*job).authed = true;
                             (*job).auth_ok_pending = false;
@@ -1637,9 +1687,59 @@ fn g_io_send_eof(dc: *DriverConn) {
     (*dc).eof_sent = true;
 }
 
-// Apply every queued io_out message: reply bytes join the
-// connection's out queue; close requests act in channel
-// order, so bytes queued before a close are flushed first.
+// Advance the out cursor past segments it has fully
+// consumed, so the head segment -- when the queue is
+// non-empty -- always has bytes remaining. A fully drained
+// queue resets to the empty state (the consumed segments'
+// storage is released with the old queue vector, exactly as
+// the pre-(c) flat queue was reset on drain).
+fn g_out_skip_done(dc: *DriverConn) {
+    while (*dc).out_idx < len((*dc).outq) {
+        if (*dc).out_off < len((*dc).outq[(*dc).out_idx]) {
+            return;
+        };
+        (*dc).out_idx = (*dc).out_idx + 1;
+        (*dc).out_off = 0;
+    }
+    if (*dc).out_idx > 0 {
+        (*dc).outq = Vec::new();
+        (*dc).out_idx = 0;
+        (*dc).out_off = 0;
+    };
+}
+
+// True when the out queue holds unwritten bytes.
+fn g_out_pending(dc: *DriverConn) -> bool {
+    g_out_skip_done(dc);
+    return (*dc).out_idx < len((*dc).outq);
+}
+
+// Consume n socket-accepted bytes at the cursor, across
+// segment boundaries. This is the partial-write resume: n is
+// whatever one write call accepted, and the cursor lands
+// byte-exactly -- the next attempt continues inside the same
+// segment at the same offset, however many rounds intervene.
+fn g_out_advance(dc: *DriverConn, n: u64) {
+    let left: u64 = n;
+    while left > 0 {
+        let rem: u64 = len((*dc).outq[(*dc).out_idx]) - (*dc).out_off;
+        if left < rem {
+            (*dc).out_off = (*dc).out_off + left;
+            left = 0;
+        } else {
+            left = left - rem;
+            (*dc).out_idx = (*dc).out_idx + 1;
+            (*dc).out_off = 0;
+        };
+    }
+    g_out_skip_done(dc);
+}
+
+// Apply every queued io_out message: reply segments move
+// into the connection's out queue (step 4: ownership moves,
+// no copy; the pre-(c) shape copied every message's bytes
+// into a flat queue); close requests act in channel order,
+// so segments queued before a close are flushed first.
 fn g_io_drain_out(st: *IoSt) {
     let ctx = (*st).ctx;
     let pending: Vec<*IoOut> = Vec::new();
@@ -1662,15 +1762,20 @@ fn g_io_drain_out(st: *IoSt) {
             let dc = (*st).slots[idx];
             if (*dc).dead != true {
                 if (*m).kind == IO_OUT_BYTES {
-                    let mb = (*m).bytes;
-                    let oq = (*dc).outq;
-                    (*dc).outq = bytes_push_range(oq, &mb, 0, len(mb));
+                    let parts = (*m).parts;
+                    (*m).parts = Vec::new();
+                    while len(parts) > 0 {
+                        let seg = parts.remove(0);
+                        if len(seg) > 0 {
+                            (*dc).outq.push(seg);
+                        };
+                    }
                 } else {
                     if (*m).kind == IO_OUT_CLOSE_NOW {
                         g_io_close(st, dc);
                     } else {
                         (*dc).close_after_flush = true;
-                        if (*dc).out_off >= len((*dc).outq) {
+                        if g_out_pending(dc) != true {
                             g_io_close(st, dc);
                         };
                     };
@@ -1719,7 +1824,7 @@ fn g_io_wait(st: *IoSt) -> bool {
                     if (*dc).read_closed != true {
                         it = it + SA_NET_POLL_READ;
                     };
-                    if (*dc).out_off < len((*dc).outq) {
+                    if g_out_pending(dc) {
                         it = it + SA_NET_POLL_WRITE;
                     };
                     ins[n] = it;
@@ -1783,14 +1888,14 @@ fn g_io_accept(st: *IoSt) {
             accepts = accepts + 1;
         } else {
             let inbox: Chan<*IoMsg> = Chan::new(16);
-            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_off: 0, ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false }));
+            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_idx: 0, out_off: 0, ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false }));
             if (*st).n < 8192 {
                 (*st).slots[(*st).n] = dc;
                 (*st).n = (*st).n + 1;
             };
             let dchan: Chan<u64> = Chan::new(0);
             let req = Box::into_raw(Box::new(CmdReq { kind: CMD_BATCH, ack: true, batch: Vec::new(), replies: Vec::new(), done: dchan }));
-            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outbuf: Vec::new(), inl_args: Vec::new(), inl_ops: Vec::new(), aof_dead: false, authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
+            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outsegs: Vec::new(), inl_args: Vec::new(), inl_ops: Vec::new(), aof_dead: false, authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
             let gh = go g_conn_main(cj);
             (*ctx).sup_reg.send((gh, h));
             accepts = accepts + 1;
@@ -1837,29 +1942,69 @@ fn g_io_read(st: *IoSt, dc: *DriverConn) {
     (*dc).inbox.send(m);
 }
 
-// One write attempt on a connection with queued output (the
-// poll model's conn_flush, one 4 KiB staged chunk): partial
-// progress is kept; a drained queue triggers a pending
-// close-after-flush; a hard error closes the connection and
-// notifies its goroutine.
+// One write attempt on a connection with queued output
+// (round-2 step 4, DESIGN (c)): gather up to OUT_STAGE_CAP
+// bytes from the out cursor -- across segment boundaries,
+// the one byte pass the word-slot Vec representation makes
+// unavoidable at the socket boundary (measured, work/
+// probe_gather.sla: plain index gather 8 ns/B, the packed-
+// export core 17 ns/B, the eliminated push_range copy
+// 59 ns/B) -- and offer them in a single write call. The
+// staging is filled through a LOCAL cursor; the persistent
+// cursor advances only by the byte count the socket actually
+// accepted, so a short write loses nothing: the unaccepted
+// tail is re-gathered from the cursor next round, byte-
+// exactly where this attempt stopped. A pending total under
+// the staging capacity (the small-total merge threshold)
+// therefore always leaves in one write call, however many
+// segments it spans, and a large total streams in staging-
+// sized fills straight off the segments -- it is never
+// materialized as one flat buffer. A drained queue triggers
+// a pending close-after-flush; a hard error closes the
+// connection and notifies its goroutine.
 fn g_io_write(st: *IoSt, dc: *DriverConn) {
-    if (*dc).out_off >= len((*dc).outq) {
+    if g_out_pending(dc) != true {
         return;
     };
-    let avail: u64 = len((*dc).outq) - (*dc).out_off;
-    let chunk: u64 = avail;
-    if chunk > 4096 {
-        chunk = 4096;
-    };
-    let arr: [u8; 4096] = [0u8; 4096];
-    let j: u64 = 0;
-    while j < chunk {
-        arr[j] = (*dc).outq[(*dc).out_off + j];
-        j = j + 1;
-    }
+    let arr: [u8; 8192] = [0u8; 8192];
     let ap: ptr = PTR_BYTE_ADD(&arr, 0);
+    let filled: u64 = 0;
+    let lidx: u64 = (*dc).out_idx;
+    let loff: u64 = (*dc).out_off;
+    while filled < OUT_STAGE_CAP {
+        if lidx >= len((*dc).outq) {
+            break;
+        };
+        let seg = &(*dc).outq[lidx];
+        let seglen: u64 = len(seg);
+        if loff >= seglen {
+            lidx = lidx + 1;
+            loff = 0;
+        } else {
+            let rem: u64 = seglen - loff;
+            let room: u64 = OUT_STAGE_CAP - filled;
+            let take: u64 = rem;
+            if take > room {
+                take = room;
+            };
+            // Index gather of the segment suffix starting at
+            // loff into the staging buffer at the fill offset
+            // (element access carries the word-slot stride;
+            // no raw segment pointer ever reaches an extern).
+            let j: u64 = 0;
+            while j < take {
+                arr[filled + j] = seg[loff + j];
+                j = j + 1;
+            }
+            filled = filled + take;
+            loff = loff + take;
+        };
+    }
+    if filled == 0 {
+        return;
+    };
     let written: u64 = 0;
-    let wst: i32 = sa_std_net_tcp_stream_write((*dc).fd, ap, chunk, &written);
+    let wst: i32 = sa_std_net_tcp_stream_write((*dc).fd, ap, filled, &written);
     if wst != SA_STD_OK {
         if ((*dc).ready & SA_NET_POLL_ERROR) != 0 {
             g_io_close(st, dc);
@@ -1871,10 +2016,8 @@ fn g_io_write(st: *IoSt, dc: *DriverConn) {
     if written == 0 {
         return;
     };
-    (*dc).out_off = (*dc).out_off + written;
-    if (*dc).out_off == len((*dc).outq) {
-        (*dc).outq = Vec::new();
-        (*dc).out_off = 0;
+    g_out_advance(dc, written);
+    if g_out_pending(dc) != true {
         if (*dc).close_after_flush {
             g_io_close(st, dc);
         };
@@ -1884,7 +2027,7 @@ fn g_io_write(st: *IoSt, dc: *DriverConn) {
 fn g_io_run(job: *IoJob) -> i32 {
     let ctx = (*job).ctx;
     let dummy_inbox: Chan<*IoMsg> = Chan::new(1);
-    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_off: 0, ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true }));
+    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_idx: 0, out_off: 0, ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true }));
     let st = Box::into_raw(Box::new(IoSt { ctx: ctx, listener: (*job).listener, wake_rx: (*job).wake_rx, slots: [sentinel; 8192], n: 0, lis_ready: 0, wake_ready: 0, any_dead: false }));
     while (*ctx).core_dead != true {
         g_io_drain_out(st);
@@ -2227,7 +2370,7 @@ fn g_sup_step(sup: *SupSt, sj: *SupJob) -> bool {
                 // its socket half-served; sockets belong to
                 // the IO driver, so the close goes through it.
                 (*sup).conn_traps = (*sup).conn_traps + 1;
-                let cm = Box::into_raw(Box::new(IoOut { fd: (*sup).mstreams[watch_idx], kind: IO_OUT_CLOSE_NOW, bytes: Vec::new() }));
+                let cm = Box::into_raw(Box::new(IoOut { fd: (*sup).mstreams[watch_idx], kind: IO_OUT_CLOSE_NOW, parts: Vec::new() }));
                 (*ctx).io_out.send(cm);
                 g_poke(ctx);
             };
