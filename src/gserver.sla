@@ -31,21 +31,26 @@
 // bookkeeping exists outside the driver.
 //
 // Redis serial semantics are preserved by construction:
-// write commands run on the single executor, which takes
-// batches from one FIFO channel, so writes execute atomically
-// one at a time in a definable global order (the executor's
-// receive order). Read commands may additionally execute in
-// the connection goroutine under the store mutex (round-2
-// step 1, g_try_inline); the global order is then the
-// interleaving of mutex acquisitions with the executor's
-// batch order, every command still atomic under one of the
-// two serializations, and per-connection order is exact
-// because a read inlines only when that connection has no
-// batch pending. Replies for a batch are
-// produced in batch order and the connection goroutine
+// commands execute atomically one at a time in a definable
+// global order. Since round-2 step 3 (W1 full inline),
+// commands normally execute in the connection goroutine
+// under the store mutex (g_try_inline), reads and writes
+// alike; the global order is the interleaving of mutex
+// acquisitions with the executor's batch order. The executor
+// still runs the fallback batches (a pass that misses the
+// try-lock, or starts with a pending batch, rides the batch
+// whole -- so per-connection order stays exact), the sweeps,
+// the serializations, and BGREWRITEAOF's dance. Replies are
+// produced in command order and the connection goroutine
 // appends them to its out buffer in that order, interleaved
 // correctly with its locally handled AUTH traffic (a pending
 // batch is always flushed before a local AUTH step runs).
+// AOF record order equals execution order by construction:
+// an inline write sends its append op on aof_chan while
+// still holding the store mutex, so op sends serialize in
+// exactly the order the writes executed; an executor batch's
+// records are likewise sent only by the executor, after its
+// own in-lock executions of that batch.
 //
 // Ownership and lifetime rules (all shapes probe-verified
 // against the master toolchain; see
@@ -72,9 +77,14 @@
 //   - CmdReq blocks are per-sender and reused: a connection
 //     owns exactly one, has at most one batch outstanding,
 //     and reuses the block for its whole lifetime.
-//   - AofOp blocks come from an executor-owned pool of 8; the
-//     writer returns each op on the recycle channel when
-//     done.
+//   - AofOp blocks come from a SrvCtx-owned pool of 256,
+//     taken and returned under the op mutex (round-2 step 3;
+//     the pool lived in the executor before). Completion is
+//     per-op: the writer signals the op's done channel
+//     (waited appends and installs), returns it on the
+//     recycle channel (executor group-commit deferrals), or
+//     returns it to the pool itself (fire-and-forget ops) --
+//     exactly one of the three, exactly once per dispatch.
 //   - A connection's CmdReq/ConnJob blocks are retained for
 //     the process lifetime (two small blocks per connection
 //     ever served). Documented here rather than hidden: the
@@ -150,6 +160,12 @@ const IO_OUT_CLOSE_NOW: u8 = 2;
 // listener) dies under the supervisor; see the header comment.
 const G_EXIT_CORE_DEAD: i32 = 71;
 
+// Inline-write wait bound (round-2 step 3): a connection pass
+// holds at most this many fsync=always append ops awaiting
+// their covering sync before it waits mid-pass (bounds
+// per-connection op holdings; see g_inline_wait).
+const INL_WAIT_CAP: u64 = 64;
+
 struct SrvCtx {
     auth: *AuthConfig,
     aof_enabled: bool,
@@ -157,14 +173,33 @@ struct SrvCtx {
     // The dataset, as an owned value field of this heap block
     // (the sound borrow shape, &(*ctx).store), and the mutex
     // that serializes every access to it (round-2 step 1).
-    // The executor used to be the store's only owner; read
-    // commands now also execute in connection goroutines under
-    // this mutex (see g_try_inline). The mutex is held only
-    // around pure store work -- never across a channel
-    // operation (the one send that does hold it arrives in
-    // step 3, with its boundedness argument recorded there).
+    // The executor used to be the store's only owner; since
+    // steps 1 and 3, read and write commands also execute in
+    // connection goroutines under this mutex (see
+    // g_try_inline). The mutex is held around pure store work
+    // plus exactly one channel operation: an inline write's
+    // append-op send on aof_chan, whose boundedness argument
+    // is recorded at g_try_inline_write (the writer drains
+    // the channel without ever needing this mutex and the
+    // channel is buffered, so the stall is at most one writer
+    // group cycle).
     store: Store,
     store_mu: u64,
+    // The AOF op pool (round-2 step 3, moved up from the
+    // executor): 256 preallocated blocks shared by every op
+    // producer -- connection goroutines dispatching inline
+    // appends, the executor's batch and install traffic.
+    // Guarded by op_mu, whose critical section is a single
+    // Vec tail take or append: nanoseconds, never held across
+    // a park. Lock order is store_mu -> op_mu at most, and in
+    // practice the two never nest (pool takes happen before
+    // the store lock is acquired or after it is released; the
+    // one in-lock operation, the append send, does not touch
+    // the pool) -- so the pool cannot become a serialisation
+    // point next to the store mutex, whose sections are whole
+    // command executions.
+    op_pool: Vec<*AofOp>,
+    op_mu: u64,
     cmd_chan: Chan<*CmdReq>,
     aof_chan: Chan<*AofOp>,
     aof_recycle: Chan<*AofOp>,
@@ -184,11 +219,14 @@ struct SrvCtx {
     core_dead: bool,
     // Sticky failure flag: written only by the AOF writer
     // goroutine (the AofState owner), read by the executor at
-    // batch boundaries. Monotonic (false -> true only), so the
-    // unsynchronized read can lag a batch but never invent a
-    // recovery that did not happen; under fsync=always the
-    // executor additionally learns failures synchronously from
-    // the op result it waits for.
+    // batch boundaries and by connection goroutines before an
+    // inline write. Monotonic (false -> true only), so the
+    // unsynchronized read can lag a command but never invent
+    // a recovery that did not happen; under fsync=always,
+    // waiters (the executor for its synchronous appends and
+    // installs, a connection for its inline appends)
+    // additionally learn failures synchronously from the op
+    // result they wait for.
     aof_broken: bool,
     yield_every: u64,
 }
@@ -211,6 +249,27 @@ struct AofOp {
     chunks: Vec<Vec<u8>>,
     data: Vec<u8>,
     result: bool,
+    // Completion protocol (round-2 step 3): the dispatcher
+    // arms exactly one of these before sending the op, and
+    // the writer completes the op exactly once, after the
+    // group's write (and, under fsync=always, its covering
+    // sync) has landed or failed:
+    //   wait: the writer signals done (cap 1) with result
+    //         set; the dispatcher waits on it and returns the
+    //         op to the pool itself. Used by every
+    //         fsync=always append not on the group-commit
+    //         path and by waited installs.
+    //   via_recycle: the writer returns the op on
+    //         aof_recycle; the executor's group-commit
+    //         pending FIFO consumes it (g_recycle_handle).
+    //   neither: fire-and-forget; the writer returns the op
+    //         to the SrvCtx pool when done with it.
+    // A wait op's done channel is drained exactly once by
+    // its waiter, so no stale token can survive into a later
+    // use of the block.
+    done: Chan<u64>,
+    wait: bool,
+    via_recycle: bool,
 }
 
 // IO driver -> connection goroutine: one read chunk (up to
@@ -267,6 +326,23 @@ struct ConnJob {
     // confined to the fallback branch; removing it (and its
     // constructor initialiser) is a separate cleanup.
     inl_args: Vec<Vec<u8>>,
+    // Inline-write sync waits (round-2 step 3): this pass's
+    // append ops dispatched under fsync=always, in send
+    // order. Their done channels are drained (and the ops
+    // returned to the pool) before the pass's replies are
+    // emitted -- g_inline_wait runs ahead of the pass-end
+    // batch flush, and INL_WAIT_CAP triggers the same wait
+    // mid-pass. Empty under every other fsync mode (those
+    // ops are fire-and-forget; the writer returns them).
+    inl_ops: Vec<*AofOp>,
+    // Latched when one of this connection's own append ops
+    // reports failure. The writer also raises the ctx-wide
+    // sticky flag (aof_broken); this per-connection latch is
+    // the synchronous, exact half for the connection that
+    // paid for the failed sync. While set, writes are
+    // refused with the AOF error, mirroring the executor's
+    // broken latch.
+    aof_dead: bool,
     authed: bool,
     close_after_flush: bool,
     yield_ct: u64,
@@ -351,10 +427,12 @@ struct SupSt {
 }
 
 // Executor-local state (Box'd once at executor entry; helpers
-// take the pointer so the op pool can be mutated in place).
+// take the pointer so the batch state can be mutated in
+// place). The op pool is NOT here any more: it moved up to
+// SrvCtx in round-2 step 3, when connection goroutines became
+// op producers too.
 struct ExecSt {
     ctx: *SrvCtx,
-    free_ops: Vec<*AofOp>,
     broken: bool,
     since_yield: u64,
     // The batch being executed and its staged journal records:
@@ -413,14 +491,80 @@ fn g_try_lock_store(ctx: *SrvCtx) -> bool {
     return acq != 0;
 }
 
-// ---- AOF op pool (executor side) ----
+// ---- AOF op pool (SrvCtx side, round-2 step 3) ----
+// The pool is shared by every op producer now that connection
+// goroutines dispatch their own appends. All accesses hold
+// op_mu for a single Vec tail operation; the take's spin
+// releases the mutex while yielding, so the mutex itself is
+// never a wait point.
+
+fn g_pool_lock(ctx: *SrvCtx) {
+    let st: i32 = sa_sync_mutex_lock((*ctx).op_mu);
+}
+
+fn g_pool_unlock(ctx: *SrvCtx) {
+    let st: i32 = sa_sync_mutex_unlock((*ctx).op_mu);
+}
+
+fn g_pool_give(ctx: *SrvCtx, op: *AofOp) {
+    g_pool_lock(ctx);
+    (*ctx).op_pool.push(op);
+    g_pool_unlock(ctx);
+}
+
+// Take one op, spinning (yield, never park) while the pool is
+// empty. The spin terminates because every op holder makes
+// progress without the spinner: the writer returns
+// fire-and-forget ops as it cycles, fsync=always waiters
+// return their op when its sync lands, and the executor's
+// recycle drain restocks group-commit ops. Nobody needs
+// op_mu (or any other lock the spinner might hold -- callers
+// take ops outside the store lock) to do any of that.
+fn g_pool_take(ctx: *SrvCtx) -> *AofOp {
+    g_pool_lock(ctx);
+    while len((*ctx).op_pool) == 0 {
+        g_pool_unlock(ctx);
+        let yst: i32 = sa_task_yield();
+        g_pool_lock(ctx);
+    }
+    let n: u64 = len((*ctx).op_pool);
+    let op = (*ctx).op_pool[n - 1];
+    // Vec has no pop in this stack: rebuild without the tail.
+    let nf: Vec<*AofOp> = Vec::new();
+    let i: u64 = 0;
+    while i + 1 < n {
+        nf.push((*ctx).op_pool[i]);
+        i = i + 1;
+    }
+    (*ctx).op_pool = nf;
+    g_pool_unlock(ctx);
+    return op;
+}
+
+// Complete one op exactly once, per the protocol its
+// dispatcher armed (see AofOp). Called only by the writer,
+// after the op's group has been written and, under
+// fsync=always, synced -- i.e. the durability point is the
+// writer's sync, exactly where it was when the executor's
+// pending FIFO was the only waiter.
+fn g_op_complete(ctx: *SrvCtx, op: *AofOp) {
+    if (*op).via_recycle {
+        (*ctx).aof_recycle.send(op);
+    } else {
+        if (*op).wait {
+            (*op).done.send(1);
+        } else {
+            g_pool_give(ctx, op);
+        };
+    };
+}
 
 // One recycled op, from whichever consumer met it first: if it
 // is the head pending (group-commit) op, its batch's done signal
 // is released now -- the covering sync has landed -- and a
 // failure marks the executor broken for subsequent batches,
-// exactly as the synchronous g_op_wait result used to. Either
-// way the op returns to the free pool.
+// exactly as the synchronous wait result used to. Either way
+// the op returns to the shared pool.
 fn g_recycle_handle(st: *ExecSt, op: *AofOp) {
     if len((*st).pend_ops) > 0 {
         if (*(*st).pend_ops[0]).idx == (*op).idx {
@@ -439,12 +583,12 @@ fn g_recycle_handle(st: *ExecSt, op: *AofOp) {
             if ok != true {
                 (*st).broken = true;
             };
-            (*st).free_ops.push(op);
+            g_pool_give((*st).ctx, op);
             g_signal(req);
             return;
         };
     };
-    (*st).free_ops.push(op);
+    g_pool_give((*st).ctx, op);
 }
 
 fn g_op_drain(st: *ExecSt) {
@@ -461,9 +605,18 @@ fn g_op_drain(st: *ExecSt) {
     }
 }
 
+// The executor's take: the plain pool take, but the spin also
+// drains the recycle channel -- the executor is the only
+// consumer of that channel, and the ops it carries are the
+// executor's own group-commit completions, so spinning on the
+// pool alone could strand them (and the batches they release)
+// behind this very take.
 fn g_op_take(st: *ExecSt) -> *AofOp {
+    let ctx = (*st).ctx;
     g_op_drain(st);
-    while len((*st).free_ops) == 0 {
+    g_pool_lock(ctx);
+    while len((*ctx).op_pool) == 0 {
+        g_pool_unlock(ctx);
         // The pool can only be empty with appends in flight
         // (group commit pipelines them); the writer recycles
         // independently, so yield + drain until one lands.
@@ -471,36 +624,51 @@ fn g_op_take(st: *ExecSt) -> *AofOp {
         // g_recycle_handle, as everywhere else.
         let yst: i32 = sa_task_yield();
         g_op_drain(st);
+        g_pool_lock(ctx);
     }
-    let n: u64 = len((*st).free_ops);
-    let op = (*st).free_ops[n - 1];
+    let n: u64 = len((*ctx).op_pool);
+    let op = (*ctx).op_pool[n - 1];
     // Vec has no pop in this stack: rebuild without the tail.
     let nf: Vec<*AofOp> = Vec::new();
     let i: u64 = 0;
     while i + 1 < n {
-        nf.push((*st).free_ops[i]);
+        nf.push((*ctx).op_pool[i]);
         i = i + 1;
     }
-    (*st).free_ops = nf;
+    (*ctx).op_pool = nf;
+    g_pool_unlock(ctx);
     return op;
 }
 
-// Wait until the writer recycles this exact op; returns its
-// result. Recycles of other ops go through g_recycle_handle
-// (they may complete pending group-commit batches).
-fn g_op_wait(st: *ExecSt, mine: *AofOp) -> bool {
+// Wait for one op dispatched with wait=true; returns its
+// result and returns the op to the pool. The wait PUMPS the
+// recycle channel: pending group-commit completions are
+// consumed (and their batches released) while this goroutine
+// waits, so the writer can never wedge on a full recycle
+// channel behind a waiter -- the executor is that channel's
+// only consumer, and when it is not in its step select it is
+// here. (Connection waiters need no pump: they are leaves --
+// nothing the writer or executor waits for depends on a
+// connection finishing its wait.)
+fn g_op_wait_done(st: *ExecSt, mine: *AofOp) -> bool {
+    let ctx = (*st).ctx;
     let waiting: bool = true;
     let res: bool = false;
     while waiting {
-        let (op, cl) = (*(*st).ctx).aof_recycle.recv();
-        if (*op).idx == (*mine).idx {
-            res = (*op).result;
-            (*st).free_ops.push(op);
-            waiting = false;
-        } else {
-            g_recycle_handle(st, op);
-        };
+        select {
+            case let dv = (*mine).done.recv() {
+                res = (*mine).result;
+                waiting = false;
+            }
+            case let rop = (*ctx).aof_recycle.recv() {
+                g_recycle_handle(st, rop);
+            }
+            default {
+                let yst: i32 = sa_task_yield();
+            }
+        }
     }
+    g_pool_give(ctx, mine);
     return res;
 }
 
@@ -517,14 +685,18 @@ fn g_aof_append(st: *ExecSt, chunks: Vec<Vec<u8>>) -> bool {
     (*op).chunks = chunks;
     (*op).data = Vec::new();
     (*op).result = false;
-    (*ctx).aof_chan.send(op);
+    (*op).via_recycle = false;
     if (*ctx).aof_fsync == AOF_FSYNC_ALWAYS {
-        let ok = g_op_wait(st, op);
+        (*op).wait = true;
+        (*ctx).aof_chan.send(op);
+        let ok = g_op_wait_done(st, op);
         if ok != true {
             (*st).broken = true;
         };
         return ok;
     };
+    (*op).wait = false;
+    (*ctx).aof_chan.send(op);
     return true;
 }
 
@@ -544,6 +716,8 @@ fn g_aof_append_defer(st: *ExecSt, chunks: Vec<Vec<u8>>, req: *CmdReq) {
     (*op).chunks = chunks;
     (*op).data = Vec::new();
     (*op).result = false;
+    (*op).wait = false;
+    (*op).via_recycle = true;
     (*ctx).aof_chan.send(op);
     (*st).pend_reqs.push(req);
     (*st).pend_ops.push(op);
@@ -560,9 +734,11 @@ fn g_aof_install(st: *ExecSt, data: Vec<u8>, wait: bool) -> bool {
     (*op).chunks = Vec::new();
     (*op).data = data;
     (*op).result = false;
+    (*op).via_recycle = false;
+    (*op).wait = wait;
     (*ctx).aof_chan.send(op);
     if wait {
-        return g_op_wait(st, op);
+        return g_op_wait_done(st, op);
     };
     return true;
 }
@@ -586,33 +762,40 @@ fn g_clone_args(args: &Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     return out;
 }
 
-// ---- inline read execution (round-2 step 1: lock + inline
-// reads, the W2 shape) ----
-// A command may execute in the connection goroutine, under the
-// store mutex, when it is neither a journal write nor
-// BGREWRITEAOF. Journal writes stay with the executor: AOF
-// record order must equal the executor's serial execution
-// order, and the group-commit machinery (op pool, pending
-// FIFO) lives there. BGREWRITEAOF stays for its
+// ---- inline execution (round-2 step 1: lock + inline
+// reads; step 3: W1 full inline, writes included) ----
+// A command may execute in the connection goroutine, under
+// the store mutex, when it is not BGREWRITEAOF. Reads inline
+// since step 1. Writes inline since step 3 (the W1 shape,
+// DESIGN 3b): the connection executes the write in-lock,
+// renders its journal record in-lock, and sends the append
+// op on aof_chan WHILE STILL HOLDING the store mutex -- so
+// op sends serialize in exactly execution order (AOF record
+// order == execution order), the send's stall is bounded
+// (the writer drains aof_chan without ever needing the store
+// mutex; the channel is buffered; the worst case is one
+// writer group cycle), and no reverse lock dependency
+// exists (the writer never takes the store mutex). The
+// durability gate moves from the executor's pending FIFO to
+// the op's own done channel (see AofOp): under fsync=always
+// the pass's replies are not emitted until every op the pass
+// dispatched has been signalled (g_inline_wait) -- the gate
+// itself, "no reply before its covering sync", is unmoved.
+// Write effects are visible to other connections' inline
+// reads before the sync lands, exactly as in the executor
+// form (which also executed first and released replies after
+// the sync) and in Redis's appendfsync=always semantics.
+// BGREWRITEAOF stays with the executor for its
 // serialize/install dance. Every mutating command in the
 // dispatch table is a journal write (verified against
-// commands.sla's dispatch list), so the inline set below is
-// exactly the read set; anything unrecognized is an
-// exec_command error reply, which is equally safe inline.
-fn g_inline_eligible(args: &Vec<Vec<u8>>) -> bool {
-    if aof_is_rewrite_command(args) {
-        return false;
-    };
-    if journal_is_write(args) {
-        return false;
-    };
-    return true;
-}
+// commands.sla's dispatch list), so the write set below is
+// exact; anything unrecognized is an exec_command error
+// reply, which is equally safe inline.
 
 // Try to execute one parsed command inline, appending its
-// reply to the connection's out buffer. Returns false when the
-// command must ride the executor batch instead:
-//   - it is not inline-eligible (see above), or
+// reply to the connection's out buffer. Returns false when
+// the command must ride the executor batch instead:
+//   - BGREWRITEAOF (the executor's dance), or
 //   - a batch is already pending for this connection: the
 //     batch must execute first (per-connection command order
 //     is a wire contract), and flushing it would park this
@@ -634,7 +817,7 @@ fn g_inline_eligible(args: &Vec<Vec<u8>>) -> bool {
 //     behind ~25 us FIFO lock handoffs and collapsed
 //     GET P=16 c50 by -75% (step-1 report); no park may
 //     appear in this fallback.
-// The one execution path that remains:
+// The execution path that remains:
 //   - try-lock acquired: no park has intervened since the
 //     parse, so borrowing pr.args (and threading the out
 //     buffer through the frame) is sound; this is the poll
@@ -643,8 +826,11 @@ fn g_try_inline(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
     if len((*(*job).req).batch) > 0 {
         return false;
     };
-    if g_inline_eligible(args) != true {
+    if aof_is_rewrite_command(args) {
         return false;
+    };
+    if journal_is_write(args) {
+        return g_try_inline_write(job, args);
     };
     let ctx = (*job).ctx;
     let now_ms: i64 = sa_time_unix_ms();
@@ -655,6 +841,128 @@ fn g_try_inline(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
         return true;
     };
     return false;
+}
+
+// The W1 write half of g_try_inline (journal writes only;
+// AOF enabled or not). Mirrors the executor's per-command
+// discipline exactly: broken-AOF refusal before execution
+// (no record, no store change), the record staged only when
+// the reply is not an error, one timestamp shared by the
+// execution and its record (the executor samples one per
+// batch; inline samples one per command, inside the lock).
+fn g_try_inline_write(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
+    let ctx = (*job).ctx;
+    if (*ctx).aof_enabled != true {
+        // No journal and no op: a write is a read-shaped
+        // inline execution (the record-ordering argument is
+        // vacuous with no AOF), same try-lock discipline.
+        let now_ms: i64 = sa_time_unix_ms();
+        if g_try_lock_store(ctx) {
+            let ob = (*job).outbuf;
+            (*job).outbuf = exec_command(&(*ctx).store, args, now_ms, ob);
+            g_unlock_store(ctx);
+            return true;
+        };
+        return false;
+    };
+    if (*ctx).aof_broken || (*job).aof_dead {
+        // Refused without executing (executor parity: the
+        // refusal touches no store state, so it needs no
+        // lock; answering inline keeps the pass's reply order
+        // exact and costs the failing connection no batch).
+        let obe = (*job).outbuf;
+        (*job).outbuf = resp_error(obe, STR_PTR("ERR AOF write failed: persistence is broken, writes are refused"), STR_LEN("ERR AOF write failed: persistence is broken, writes are refused"));
+        return true;
+    };
+    // The op is taken BEFORE the store lock: every
+    // park-prone pool operation stays outside the lock, and
+    // an unused op (try-lock miss, errored command) is simply
+    // handed back. Only the send below happens in-lock.
+    let op = g_pool_take(ctx);
+    if g_try_lock_store(ctx) != true {
+        g_pool_give(ctx, op);
+        return false;
+    };
+    let now_ms: i64 = sa_time_unix_ms();
+    let rep = exec_command(&(*ctx).store, args, now_ms, Vec::new());
+    let is_err: bool = true;
+    if len(rep) > 0 {
+        if rep[0] != 45 {
+            is_err = false;
+        };
+    };
+    if is_err != true {
+        let chc: Vec<Vec<u8>> = Vec::new();
+        chc.push(journal_record(args, now_ms));
+        (*op).kind = AOF_OP_APPEND;
+        (*op).chunks = chc;
+        (*op).data = Vec::new();
+        (*op).result = false;
+        (*op).via_recycle = false;
+        (*op).wait = (*ctx).aof_fsync == AOF_FSYNC_ALWAYS;
+        // THE in-lock send (DESIGN 3b): because this send
+        // happens while the store mutex serializes writers,
+        // aof_chan order == execution order across every
+        // producer (connections here; the executor for its
+        // batches, whose sends follow its own in-lock
+        // executions of that batch). The auto-rewrite
+        // ordering argument also rests on this: a write whose
+        // append is queued before the executor's install op
+        // has necessarily executed before the serialization
+        // that install carries (its lock hold preceded the
+        // executor's), so the snapshot includes it; a write
+        // queued after lands in the new file. The stall is
+        // bounded by one writer group cycle: the writer
+        // drains this channel without the store mutex, and
+        // the channel is buffered (64) besides.
+        (*ctx).aof_chan.send(op);
+    };
+    g_unlock_store(ctx);
+    let ob2 = (*job).outbuf;
+    (*job).outbuf = bytes_push_range(ob2, &rep, 0, len(rep));
+    if is_err {
+        g_pool_give(ctx, op);
+        return true;
+    };
+    if (*ctx).aof_fsync == AOF_FSYNC_ALWAYS {
+        (*job).inl_ops.push(op);
+        if len((*job).inl_ops) >= INL_WAIT_CAP {
+            g_inline_wait(job);
+        };
+    };
+    // Other modes: fire-and-forget -- the writer returns the
+    // op to the pool when done with it.
+    return true;
+}
+
+// Drain this pass's fsync=always sync waits, in send order:
+// each op's done fires only after the writer's group sync
+// covering its record has landed (or failed). A failure
+// latches the connection's aof_dead (the writer also raises
+// the ctx sticky flag). Replies accumulated so far are NOT
+// emitted before this returns -- g_conn_step calls it ahead
+// of the pass-end flush/emit, and INL_WAIT_CAP calls it
+// mid-pass -- which is what keeps the durability invariant
+// in the W1 shape: a reply is released only after a sync
+// covering its record completed. If the peer has meanwhile
+// reset the connection, nothing here changes shape: the
+// wait is a channel park (the same posture as the old
+// batch done wait), the sync lands, the pass finishes, the
+// emit drains into a dead out queue the driver discards,
+// and the end-of-stream pass closes the connection cleanly.
+fn g_inline_wait(job: *ConnJob) {
+    let ctx = (*job).ctx;
+    let i: u64 = 0;
+    while i < len((*job).inl_ops) {
+        let op = (*job).inl_ops[i];
+        let (dv, dcl) = (*op).done.recv();
+        if (*op).result != true {
+            (*job).aof_dead = true;
+        };
+        g_pool_give(ctx, op);
+        i = i + 1;
+    }
+    (*job).inl_ops = Vec::new();
 }
 
 // ---- connection goroutine ----
@@ -807,6 +1115,11 @@ fn g_conn_step(job: *ConnJob) -> bool {
                 };
             };
         }
+        // The pass's inline-write sync waits land before any
+        // reply of this pass is emitted (the durability gate,
+        // g_inline_wait); the batch flush below keeps its own
+        // done wait for whatever rode the executor.
+        g_inline_wait(job);
         g_flush_batch(job);
         // compact the input buffer (same rules as the poll loop)
         if (*job).inoff == len((*job).inbuf) {
@@ -938,16 +1251,10 @@ fn g_exec_batch(st: *ExecSt, req: *CmdReq) -> bool {
 
 fn g_exec_main(job: *ExecJob) {
     let ctx = (*job).ctx;
-    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, free_ops: Vec::new(), broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new(), pend_reqs: Vec::new(), pend_ops: Vec::new() }));
-    // The op pool is sized for group commit: under fsync=always
-    // many batches' appends are in flight at once (one per
-    // pending batch), where the synchronous form needed one.
-    let pi: u64 = 0;
-    while pi < 256 {
-        let op = Box::into_raw(Box::new(AofOp { kind: AOF_OP_APPEND, idx: pi, chunks: Vec::new(), data: Vec::new(), result: false }));
-        (*st).free_ops.push(op);
-        pi = pi + 1;
-    }
+    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new(), pend_reqs: Vec::new(), pend_ops: Vec::new() }));
+    // The op pool lives in SrvCtx (created in
+    // run_server_goroutine before any goroutine spawns): it
+    // is shared with the connection goroutines since step 3.
     // Loop body is a single call (the channel-op discipline
     // at g_conn_main): the recv lives in g_exec_step.
     while true {
@@ -1051,7 +1358,7 @@ fn g_aof_step(job: *AofJob) {
                     if (*job).wst.broken {
                         (*ctx).aof_broken = true;
                     };
-                    (*ctx).aof_recycle.send(op);
+                    g_op_complete(ctx, op);
                 } else {
                     let group: Vec<*AofOp> = Vec::new();
                     group.push(op);
@@ -1142,11 +1449,31 @@ fn g_aof_step(job: *AofJob) {
                     if (*job).wst.broken {
                         (*ctx).aof_broken = true;
                     };
+                    // Completion (round-2 step 3 protocol,
+                    // g_op_complete): done-signals and pool
+                    // returns first -- they can never block --
+                    // then the executor's recycle feed, whose
+                    // sends may wait for the executor to drain
+                    // (it does: step select, op-take drain, or
+                    // the wait pump). Every op's result was
+                    // set above, before any completion is
+                    // signalled, so no waiter can observe a
+                    // half-completed group.
                     let ri: u64 = 0;
                     while ri < len(group) {
                         let rop = group[ri];
-                        (*ctx).aof_recycle.send(rop);
+                        if (*rop).via_recycle != true {
+                            g_op_complete(ctx, rop);
+                        };
                         ri = ri + 1;
+                    }
+                    let rj: u64 = 0;
+                    while rj < len(group) {
+                        let rop2 = group[rj];
+                        if (*rop2).via_recycle {
+                            g_op_complete(ctx, rop2);
+                        };
+                        rj = rj + 1;
                     }
                     if has_install {
                         if (*job).wst.broken {
@@ -1158,7 +1485,7 @@ fn g_aof_step(job: *AofJob) {
                         if (*job).wst.broken {
                             (*ctx).aof_broken = true;
                         };
-                        (*ctx).aof_recycle.send(install_op);
+                        g_op_complete(ctx, install_op);
                     };
                 };
             }
@@ -1463,7 +1790,7 @@ fn g_io_accept(st: *IoSt) {
             };
             let dchan: Chan<u64> = Chan::new(0);
             let req = Box::into_raw(Box::new(CmdReq { kind: CMD_BATCH, ack: true, batch: Vec::new(), replies: Vec::new(), done: dchan }));
-            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outbuf: Vec::new(), inl_args: Vec::new(), authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
+            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outbuf: Vec::new(), inl_args: Vec::new(), inl_ops: Vec::new(), aof_dead: false, authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
             let gh = go g_conn_main(cj);
             (*ctx).sup_reg.send((gh, h));
             accepts = accepts + 1;
@@ -1710,12 +2037,34 @@ fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig
     if mst != 0 {
         return 67;
     };
+    // The AOF op pool (round-2 step 3): preallocated here,
+    // before any goroutine exists, so no producer ever
+    // allocates an op at run time. Sized for group commit:
+    // under fsync=always many appends are in flight at once
+    // (one per unreleased write across all connections, one
+    // per pending executor batch), where a purely synchronous
+    // world needed one.
+    let op_mu: u64 = 0;
+    let mst2: i32 = sa_sync_mutex_new(&op_mu);
+    if mst2 != 0 {
+        return 67;
+    };
+    let op_pool: Vec<*AofOp> = Vec::new();
+    let pi: u64 = 0;
+    while pi < 256 {
+        let dch: Chan<u64> = Chan::new(1);
+        let opx = Box::into_raw(Box::new(AofOp { kind: AOF_OP_APPEND, idx: pi, chunks: Vec::new(), data: Vec::new(), result: false, done: dch, wait: false, via_recycle: false }));
+        op_pool.push(opx);
+        pi = pi + 1;
+    }
     let ctx = Box::into_raw(Box::new(SrvCtx {
         auth: authp,
         aof_enabled: aof_enabled_v,
         aof_fsync: aof_fsync_v,
         store: store,
         store_mu: store_mu,
+        op_pool: op_pool,
+        op_mu: op_mu,
         cmd_chan: cmd_chan,
         aof_chan: aof_chan,
         aof_recycle: aof_recycle,
