@@ -1,16 +1,27 @@
 // store.sla -- the slaredis keyspace.
 //
 // Representation:
-//   One Entry per key in a single Vec, found by linear scan with an
-//   FNV-1a pre-filter. Payloads live inline in the Entry as Vec<u8>
-//   byte strings / Vec pairs. Since M1, small aggregates (hash /
-//   set / zset) start in the compact listpack representation
-//   (Entry.pack, listpack.sla) and convert one-way to the plain
-//   vectors past the thresholds declared below -- the same shape
-//   Redis uses, with intset/skiplist/rax still future work.
-//   Deletion and expiry tombstone the entry (kind = KIND_DEAD,
-//   payloads released); insert reuses dead slots, and the sweeper
-//   compacts when tombstones dominate.
+//   One Entry per key in a single Vec (Store.entries); every
+//   key-based access goes through the B1 open-addressing index
+//   layered over it (Store.index: key hash -> entry index,
+//   power-of-two capacity, load factor 0.7, linear probing), so
+//   find/insert are expected O(1) instead of the M0 linear scan.
+//   The entries Vec and all index-based command code are the M0
+//   shape unchanged, and two invariants keep the index layer
+//   unobservable: tombstone slots are reused smallest-first
+//   (Store.free_slots is a min-heap -- exactly the slot the old
+//   scan reported first, so the entries order, and therefore
+//   the AOF rewrite byte order, is unchanged), and compaction
+//   rebuilds the index wholesale. Payloads live inline in the
+//   Entry as Vec<u8> byte strings / Vec pairs. Since M1, small
+//   aggregates (hash / set / zset) start in the compact listpack
+//   representation (Entry.pack, listpack.sla) and convert
+//   one-way to the plain vectors past the thresholds declared
+//   below -- the same shape Redis uses, with intset/skiplist/
+//   rax still future work. Deletion and expiry tombstone the
+//   entry (kind = KIND_DEAD, payloads released); insert reuses
+//   dead slots, and the sweeper compacts when tombstones
+//   dominate.
 //
 // Expiry: expire_ms is a unix-ms deadline, 0 = no expiry. Expiry is
 // enforced lazily inside store_find (an expired key is tombstoned
@@ -81,6 +92,18 @@ struct Entry {
 struct Store {
     entries: Vec<Entry>,
     dead_count: u64,
+    // B1 key index (open addressing over `entries`): cell value
+    // is entry index + 1, 0 = empty, IDX_TOMB = a deleted key's
+    // cell (probing continues past it). Length is a power of two
+    // (0 = not built yet; built lazily on first insert).
+    // index_tombs counts IDX_TOMB cells.
+    index: Vec<i64>,
+    index_tombs: u64,
+    // Tombstoned entry slots awaiting reuse, as a min-heap
+    // (smallest slot on top). Insert reuses the smallest dead
+    // slot -- the same slot the pre-B1 linear scan reported --
+    // so entries order is preserved exactly.
+    free_slots: Vec<u64>,
 }
 
 fn entry_blank(key: &Vec<u8>, key_hash: u64, kind: u8) -> Entry {
@@ -102,15 +125,283 @@ fn entry_blank(key: &Vec<u8>, key_hash: u64, kind: u8) -> Entry {
 }
 
 fn store_new() -> Store {
-    return Store { entries: Vec::new(), dead_count: 0 };
+    return Store {
+        entries: Vec::new(),
+        dead_count: 0,
+        index: Vec::new(),
+        index_tombs: 0,
+        free_slots: Vec::new(),
+    };
+}
+
+// ---- B1 key index: open addressing over the entries Vec ----
+//
+// Cells hold entry index + 1; 0 is empty and IDX_TOMB marks a
+// deleted key (probes skip it, inserts may claim it). The table
+// is a power of two, grows (or is rehashed in place to clear
+// tombstones) whenever an insert would push (live + tombs) past
+// a 0.7 load factor. Bucket placement runs the stored FNV-1a
+// key hash through the splitmix64 finalizer so sequential keys
+// ("key:000001", "key:000002", ...) scatter across the table
+// instead of clustering in FNV's correlated low bits.
+
+const IDX_TOMB: i64 = -1;
+
+fn idx_mix(h: u64) -> u64 {
+    let mz: u64 = h;
+    mz = (mz ^ (mz >> 30)) * 13787848793156543929;
+    mz = (mz ^ (mz >> 27)) * 10723151780598845931;
+    return mz ^ (mz >> 31);
+}
+
+// Probe the index for `key`. Returns (entry_index, cell) with
+// entry_index >= 0 on a live hit (cell = the cell holding it),
+// or entry_index == -1 with cell = where an insert of this key
+// belongs (the first tombstone cell passed, else the empty cell
+// that ended the probe). An empty (never-built) index reports
+// (-1, 0); callers that insert build the table first (idx_ensure).
+fn idx_probe(s: &Store, key: &Vec<u8>, key_hash: u64) -> (i64, u64) {
+    let ix_cap: u64 = len(s.index);
+    if ix_cap == 0 {
+        return (-1, 0);
+    };
+    let ix_mask: u64 = ix_cap - 1;
+    let ix_pos: u64 = idx_mix(key_hash) & ix_mask;
+    let ix_tomb: i64 = -1;
+    let ix_n: u64 = 0;
+    while ix_n < ix_cap {
+        let ix_cell: i64 = s.index[ix_pos];
+        if ix_cell == 0 {
+            if ix_tomb >= 0 {
+                return (-1, ix_tomb as u64);
+            };
+            return (-1, ix_pos);
+        };
+        if ix_cell == IDX_TOMB {
+            if ix_tomb < 0 {
+                ix_tomb = ix_pos as i64;
+            };
+        } else {
+            let ix_ei: u64 = (ix_cell - 1) as u64;
+            if s.entries[ix_ei].kind != KIND_DEAD {
+                if s.entries[ix_ei].key_hash == key_hash {
+                    if bytes_eq(&s.entries[ix_ei].key, key) {
+                        return (ix_ei as i64, ix_pos);
+                    };
+                };
+            };
+        };
+        ix_pos = (ix_pos + 1) & ix_mask;
+        ix_n = ix_n + 1;
+    }
+    // No empty cell exists (the 0.7 load invariant should make
+    // this unreachable): fall back to the first tombstone cell.
+    if ix_tomb >= 0 {
+        return (-1, ix_tomb as u64);
+    };
+    return (-1, 0);
+}
+
+// Place entry `ei` in a freshly built (all-empty) index by hash
+// alone -- keys are unique, so no byte comparison is needed.
+fn idx_put_fresh(s: &Store, key_hash: u64, ei: u64) {
+    let pf_mask: u64 = len(s.index) - 1;
+    let pf_pos: u64 = idx_mix(key_hash) & pf_mask;
+    while s.index[pf_pos] != 0 {
+        pf_pos = (pf_pos + 1) & pf_mask;
+    }
+    s.index[pf_pos] = (ei as i64) + 1;
+}
+
+// Rebuild the index at capacity `new_cap` (a power of two) from
+// the live entries; tombstone cells are dropped.
+fn idx_rehash(s: &Store, new_cap: u64) {
+    let rh_fresh: Vec<i64> = Vec::new();
+    let rh_i: u64 = 0;
+    while rh_i < new_cap {
+        rh_fresh.push(0);
+        rh_i = rh_i + 1;
+    }
+    s.index = rh_fresh;
+    s.index_tombs = 0;
+    let rh_j: u64 = 0;
+    while rh_j < len(s.entries) {
+        if s.entries[rh_j].kind != KIND_DEAD {
+            idx_put_fresh(s, s.entries[rh_j].key_hash, rh_j);
+        };
+        rh_j = rh_j + 1;
+    }
+}
+
+// Smallest power-of-two capacity >= 64 that keeps `live` keys
+// at or under the 0.7 load factor.
+fn idx_cap_for(live: u64) -> u64 {
+    let cf_cap: u64 = 64;
+    while live * 10 > cf_cap * 7 {
+        cf_cap = cf_cap * 2;
+    }
+    return cf_cap;
+}
+
+// Guarantee room for one more key before an insert: build the
+// index on first use, grow it when the insert would cross the
+// 0.7 load factor, and rehash in place (same capacity) when
+// tombstone cells are what crosses it.
+fn idx_ensure(s: &Store) {
+    let ie_live: u64 = len(s.entries) - s.dead_count;
+    let ie_cap: u64 = len(s.index);
+    if ie_cap == 0 {
+        idx_rehash(s, idx_cap_for(ie_live + 1));
+        return;
+    };
+    let ie_used: u64 = ie_live + s.index_tombs;
+    if (ie_used + 1) * 10 > ie_cap * 7 {
+        let ie_want: u64 = idx_cap_for(ie_live + 1);
+        if ie_want < ie_cap {
+            idx_rehash(s, ie_cap);
+        } else {
+            idx_rehash(s, ie_want);
+        };
+    };
+}
+
+// Record entry `ei` as the index target for `key` (the caller
+// has run idx_ensure and verified the key absent; a hit here
+// would mean a duplicate insert, and the cell is repointed so
+// the index at least tracks the newest entry).
+fn idx_insert(s: &Store, key: &Vec<u8>, key_hash: u64, ei: u64) {
+    let (ii_found, ii_pos) = idx_probe(s, key, key_hash);
+    if ii_found < 0 {
+        if s.index[ii_pos] == IDX_TOMB {
+            s.index_tombs = s.index_tombs - 1;
+        };
+    };
+    s.index[ii_pos] = (ei as i64) + 1;
+}
+
+// Drop `key` from the index, leaving a tombstone cell so probe
+// chains that pass through it stay intact.
+fn idx_remove(s: &Store, key: &Vec<u8>, key_hash: u64) {
+    let (ir_found, ir_pos) = idx_probe(s, key, key_hash);
+    if ir_found >= 0 {
+        s.index[ir_pos] = IDX_TOMB;
+        s.index_tombs = s.index_tombs + 1;
+    };
+}
+
+// ---- free-slot min-heap (tombstone slot reuse) ----
+//
+// entry_tombstone pushes the freed slot; inserts claim the
+// smallest one. Keeping the heap ordered reproduces the pre-B1
+// scan's first-dead-slot choice bit for bit, which is what
+// keeps the entries order (and AOF rewrite bytes) identical.
+
+fn fh_push(s: &Store, slot: u64) {
+    s.free_slots.push(slot);
+    let fp_c: u64 = len(s.free_slots) - 1;
+    while fp_c > 0 {
+        let fp_p: u64 = (fp_c - 1) / 2;
+        if s.free_slots[fp_p] <= s.free_slots[fp_c] {
+            break;
+        };
+        let fp_t: u64 = s.free_slots[fp_p];
+        s.free_slots[fp_p] = s.free_slots[fp_c];
+        s.free_slots[fp_c] = fp_t;
+        fp_c = fp_p;
+    }
+}
+
+// Smallest reusable slot, or -1 when no tombstone is waiting.
+fn fh_peek(s: &Store) -> i64 {
+    if len(s.free_slots) == 0 {
+        return -1;
+    };
+    return s.free_slots[0] as i64;
+}
+
+// Remove `slot` from the heap wherever it sits (insert claimed
+// it). No-op when absent.
+fn fh_discard(s: &Store, slot: u64) {
+    let fd_n: u64 = len(s.free_slots);
+    let fd_at: i64 = -1;
+    let fd_i: u64 = 0;
+    while fd_i < fd_n {
+        if s.free_slots[fd_i] == slot {
+            fd_at = fd_i as i64;
+            break;
+        };
+        fd_i = fd_i + 1;
+    }
+    if fd_at < 0 {
+        return;
+    };
+    let fd_pos: u64 = fd_at as u64;
+    let fd_last = s.free_slots.pop();
+    let fd_m: u64 = len(s.free_slots);
+    if fd_pos >= fd_m {
+        return;
+    };
+    match fd_last {
+        Some(fd_v) => {
+            s.free_slots[fd_pos] = fd_v;
+        },
+        None => {
+            return;
+        },
+    };
+    // The replacement element came from a leaf: sift it up when
+    // it beats its parent, otherwise sift it down (the standard
+    // one-direction heap delete).
+    if fd_pos > 0 {
+        let fd_pp: u64 = (fd_pos - 1) / 2;
+        if s.free_slots[fd_pos] < s.free_slots[fd_pp] {
+            let fd_c: u64 = fd_pos;
+            while fd_c > 0 {
+                let fd_p2: u64 = (fd_c - 1) / 2;
+                if s.free_slots[fd_p2] <= s.free_slots[fd_c] {
+                    break;
+                };
+                let fd_t: u64 = s.free_slots[fd_p2];
+                s.free_slots[fd_p2] = s.free_slots[fd_c];
+                s.free_slots[fd_c] = fd_t;
+                fd_c = fd_p2;
+            }
+            return;
+        };
+    };
+    let fd_c2: u64 = fd_pos;
+    while true {
+        let fd_l: u64 = fd_c2 * 2 + 1;
+        let fd_r: u64 = fd_l + 1;
+        let fd_small: u64 = fd_c2;
+        if fd_l < fd_m {
+            if s.free_slots[fd_l] < s.free_slots[fd_small] {
+                fd_small = fd_l;
+            };
+        };
+        if fd_r < fd_m {
+            if s.free_slots[fd_r] < s.free_slots[fd_small] {
+                fd_small = fd_r;
+            };
+        };
+        if fd_small == fd_c2 {
+            break;
+        };
+        let fd_t2: u64 = s.free_slots[fd_small];
+        s.free_slots[fd_small] = s.free_slots[fd_c2];
+        s.free_slots[fd_c2] = fd_t2;
+        fd_c2 = fd_small;
+    }
 }
 
 // Release an entry's payloads and mark it dead. The key bytes are
-// kept (harmless; the slot is reused or compacted later).
+// kept (harmless; the slot is reused or compacted later). The
+// key leaves the B1 index and the slot joins the free-slot heap.
 fn entry_tombstone(s: &Store, i: u64) {
     if s.entries[i].kind == KIND_DEAD {
         return;
     };
+    idx_remove(s, &s.entries[i].key, s.entries[i].key_hash);
     s.entries[i].kind = KIND_DEAD;
     s.entries[i].expire_ms = 0;
     s.entries[i].enc = ENC_PLAIN;
@@ -123,6 +414,7 @@ fn entry_tombstone(s: &Store, i: u64) {
     s.entries[i].smembers = Vec::new();
     s.entries[i].zrows = Vec::new();
     s.dead_count = s.dead_count + 1;
+    fh_push(s, i);
 }
 
 // Reset a live entry in place to a new kind with empty payloads
@@ -223,38 +515,35 @@ fn list_pop_head(s: &Store, e: u64) -> Vec<u8> {
     return hp_val;
 }
 
-// One scan that answers both questions the create paths used to
-// pay two full scans for (F-perf-5): the live index of `key`
-// (-1 when absent, with store_find's lazy-expiry semantics) and
-// the first tombstone slot an insert may reuse (-1 when none).
-// When the key's own entry turns out expired it is tombstoned
-// and becomes the reuse candidate, exactly as the old find-then-
-// insert sequence behaved.
+// One probe that answers both questions the create paths used
+// to pay a full scan for (F-perf-5; since B1 an index probe
+// instead of the scan): the live index of `key` (-1 when absent,
+// with store_find's lazy-expiry semantics) and the first
+// tombstone slot an insert may reuse (-1 when none). "First" is
+// literal: the free-slot heap's minimum is exactly the slot the
+// old scan met first, and when the key's own entry turns out
+// expired it is tombstoned (which pushes its slot on the heap)
+// before the minimum is read -- so the returned pair, and the
+// entries order every insert produces, are identical to the
+// scan's, exactly as the old find-then-insert sequence behaved.
 fn store_find_slot(s: &Store, key: &Vec<u8>, key_hash: u64, now_ms: i64) -> (i64, i64) {
-    let fs_dead: i64 = -1;
-    let fs_i: u64 = 0;
-    while fs_i < len(s.entries) {
-        if s.entries[fs_i].kind == KIND_DEAD {
-            if fs_dead < 0 {
-                fs_dead = fs_i as i64;
-            };
-        } else {
-            if s.entries[fs_i].key_hash == key_hash {
-                if bytes_eq(&s.entries[fs_i].key, key) {
-                    if entry_expired(s, fs_i, now_ms) {
-                        entry_tombstone(s, fs_i);
-                        if fs_dead < 0 {
-                            fs_dead = fs_i as i64;
-                        };
-                        return (-1, fs_dead);
-                    };
-                    return (fs_i as i64, fs_dead);
-                };
-            };
-        };
-        fs_i = fs_i + 1;
-    }
-    return (-1, fs_dead);
+    let (fs_idx, _fs_cell) = idx_probe(s, key, key_hash);
+    if fs_idx < 0 {
+        return (-1, fh_peek(s));
+    };
+    let fs_u: u64 = fs_idx as u64;
+    if entry_expired(s, fs_u, now_ms) {
+        entry_tombstone(s, fs_u);
+        return (-1, fh_peek(s));
+    };
+    // Live hit: the old scan only reported tombstones it had
+    // passed before reaching the key, i.e. slots < fs_idx; the
+    // heap minimum qualifies exactly when it precedes the hit.
+    let fs_d: i64 = fh_peek(s);
+    if fs_d >= fs_idx {
+        return (fs_idx, -1);
+    };
+    return (fs_idx, fs_d);
 }
 
 // Find a live entry by key. Applies lazy expiry: an expired entry
@@ -266,29 +555,30 @@ fn store_find(s: &Store, key: &Vec<u8>, key_hash: u64, now_ms: i64) -> i64 {
 
 // Insert a fresh entry of the given kind into the tombstone slot
 // `dead` (from store_find_slot), or append when dead < 0. The
-// caller has verified the key is absent.
+// caller has verified the key is absent. The B1 index gains the
+// key (growing/rehashing first when the load factor demands)
+// and the claimed slot leaves the free-slot heap.
 fn store_insert_at(s: &Store, key: &Vec<u8>, key_hash: u64, kind: u8, dead: i64) -> i64 {
+    idx_ensure(s);
     if dead >= 0 {
         let d: u64 = dead as u64;
+        fh_discard(s, d);
         s.entries[d] = entry_blank(key, key_hash, kind);
         s.dead_count = s.dead_count - 1;
+        idx_insert(s, key, key_hash, d);
         return dead;
     };
     s.entries.push(entry_blank(key, key_hash, kind));
-    return (len(s.entries) - 1) as i64;
+    let ni: u64 = len(s.entries) - 1;
+    idx_insert(s, key, key_hash, ni);
+    return ni as i64;
 }
 
 // Insert a fresh entry of the given kind (caller has verified the
-// key is absent). Reuses a tombstone slot when one exists.
+// key is absent). Reuses the smallest tombstone slot when one
+// exists -- the slot the pre-B1 scan found first.
 fn store_insert(s: &Store, key: &Vec<u8>, key_hash: u64, kind: u8) -> i64 {
-    let i: u64 = 0;
-    while i < len(s.entries) {
-        if s.entries[i].kind == KIND_DEAD {
-            return store_insert_at(s, key, key_hash, kind, i as i64);
-        };
-        i = i + 1;
-    }
-    return store_insert_at(s, key, key_hash, kind, -1);
+    return store_insert_at(s, key, key_hash, kind, fh_peek(s));
 }
 
 // Switch a fresh aggregate entry to the packed representation
@@ -479,6 +769,12 @@ fn store_sweep(s: &Store, now_ms: i64) -> u64 {
             }
             s.entries = fresh;
             s.dead_count = 0;
+            // Compaction renumbered every entry: the free-slot
+            // heap is empty by construction (no tombstones
+            // survive) and the B1 index is rebuilt over the new
+            // numbering at fit capacity.
+            s.free_slots = Vec::new();
+            idx_rehash(s, idx_cap_for(len(s.entries)));
         };
     };
     return removed;
