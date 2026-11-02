@@ -69,6 +69,12 @@ struct AofState {
     // passes; aof_rewrite flushes it before serializing so no
     // staged record can land after the rename.
     pending: Vec<Vec<u8>>,
+    // Write staging for aof_write_all (knife1, 2026-11-02):
+    // aof_write_all used to declare a per-call [u8; 4096] stack
+    // local per chunk and paid the full-size refill (~16 us)
+    // on every chunk of every flush. As a state field it is
+    // filled once; only the staged chunk's bytes are touched.
+    wbuf: [u8; 4096],
 }
 
 fn aof_state_new(cfg: &AofConfig) -> AofState {
@@ -83,6 +89,7 @@ fn aof_state_new(cfg: &AofConfig) -> AofState {
         unsynced: 0,
         broken: false,
         pending: Vec::new(),
+        wbuf: [0u8; 4096],
     };
 }
 
@@ -112,23 +119,27 @@ fn aof_open_append(path: &Vec<u8>) -> (bool, u64) {
 }
 
 // Write all of `data` to an open file handle, in 4 KiB staged
-// chunks (partial writes advance and retry).
-fn aof_write_all(file: u64, data: &Vec<u8>) -> bool {
+// chunks (partial writes advance and retry). The staging buffer
+// is the caller's persistent AofState.wbuf, passed as a raw
+// pointer (see the field note for the per-call refill tax this
+// replaces); staging writes go through the pointer for the same
+// reason as conn_flush (knife1 probe_t3).
+fn aof_write_all(file: u64, data: &Vec<u8>, stage: ptr) -> bool {
     let off: u64 = 0;
     while off < len(data) {
         let chunk: u64 = len(data) - off;
         if chunk > 4096 {
             chunk = 4096;
         };
-        let arr: [u8; 4096] = [0u8; 4096];
         let j: u64 = 0;
         while j < chunk {
-            arr[j] = data[off + j];
+            let dp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp, stage, j);
+            PTR_WRITE_U8(dp, data[off + j]);
             j = j + 1;
         }
-        let ap: ptr = PTR_BYTE_ADD(&arr, 0);
         let written: u64 = 0;
-        let st: i32 = sa_std_fs_file_write(file, ap, chunk, &written);
+        let st: i32 = sa_std_fs_file_write(file, stage, chunk, &written);
         if st != SA_STD_OK {
             return false;
         };
@@ -223,7 +234,7 @@ fn aof_flush_write(st: &AofState, now_ms: i64) -> bool {
     let total: u64 = 0;
     let ci: u64 = 0;
     while ci < len(chunks) {
-        if aof_write_all(st.file, &chunks[ci]) != true {
+        if aof_write_all(st.file, &chunks[ci], PTR_BYTE_ADD(&st.wbuf, 0)) != true {
             st.broken = true;
             return false;
         };
@@ -254,7 +265,7 @@ fn aof_write_group(st: &AofState, data: &Vec<u8>) -> bool {
     if st.broken {
         return false;
     };
-    if aof_write_all(st.file, data) != true {
+    if aof_write_all(st.file, data, PTR_BYTE_ADD(&st.wbuf, 0)) != true {
         st.broken = true;
         return false;
     };
@@ -493,7 +504,7 @@ fn aof_swap_in(st: &AofState, data: &Vec<u8>, now_ms: i64) -> bool {
     if ost != SA_STD_OK {
         return false;
     };
-    if aof_write_all(h, data) != true {
+    if aof_write_all(h, data, PTR_BYTE_ADD(&st.wbuf, 0)) != true {
         let cc = sa_fs_file_close(h);
         let rr = aof_remove_file(&tmp2);
         return false;

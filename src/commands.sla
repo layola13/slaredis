@@ -487,6 +487,14 @@ fn cmd_object(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<
 // ---- hash commands ----
 
 fn hash_field_index(s: &Store, e: u64, field: &Vec<u8>) -> i64 {
+    // Past MIDX_MIN fields the membership test goes through the
+    // entry's member index (store.sla); below it the linear scan
+    // is cheaper. A packed entry's hfields are empty, so both
+    // paths agree on -1 there, as before.
+    if len(s.entries[e].hfields) >= MIDX_MIN {
+        midx_ensure(s, e);
+        return midx_find(s, e, field);
+    };
     let i: u64 = 0;
     while i < len(s.entries[e].hfields) {
         if bytes_eq(&s.entries[e].hfields[i], field) {
@@ -565,6 +573,7 @@ fn cmd_hset(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         } else {
             s.entries[e].hfields.push(bytes_clone(&args[i]));
             s.entries[e].hvalues.push(bytes_clone(&args[i + 1]));
+            midx_note_append(s, e, &args[i]);
             added = added + 1;
         };
         i = i + 2;
@@ -639,6 +648,7 @@ fn cmd_hdel(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         if fi >= 0 {
             let dropped_f = s.entries[e].hfields.remove(fi as u64);
             let dropped_v = s.entries[e].hvalues.remove(fi as u64);
+            midx_drop(s, e);
             removed = removed + 1;
         };
         i = i + 1;
@@ -916,6 +926,12 @@ fn cmd_llen(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
 // ---- set commands ----
 
 fn set_member_index(s: &Store, e: u64, member: &Vec<u8>) -> i64 {
+    // Member-index path past MIDX_MIN, linear scan below it
+    // (see hash_field_index).
+    if len(s.entries[e].smembers) >= MIDX_MIN {
+        midx_ensure(s, e);
+        return midx_find(s, e, member);
+    };
     let i: u64 = 0;
     while i < len(s.entries[e].smembers) {
         if bytes_eq(&s.entries[e].smembers[i], member) {
@@ -981,6 +997,7 @@ fn cmd_sadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
     while i < len(args) {
         if set_member_index(s, e, &args[i]) < 0 {
             s.entries[e].smembers.push(bytes_clone(&args[i]));
+            midx_note_append(s, e, &args[i]);
             added = added + 1;
         };
         i = i + 1;
@@ -1023,6 +1040,7 @@ fn cmd_srem(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         let mi: i64 = set_member_index(s, e, &args[i]);
         if mi >= 0 {
             let dropped = s.entries[e].smembers.remove(mi as u64);
+            midx_drop(s, e);
             removed = removed + 1;
         };
         i = i + 1;
@@ -1096,6 +1114,12 @@ fn cmd_sismember(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> V
 // representation, recorded in docs/M0_DELIVERY.md.
 
 fn zset_member_index(s: &Store, e: u64, member: &Vec<u8>) -> i64 {
+    // Member-index path past MIDX_MIN, linear scan below it
+    // (see hash_field_index).
+    if len(s.entries[e].zrows) >= MIDX_MIN {
+        midx_ensure(s, e);
+        return midx_find(s, e, member);
+    };
     let i: u64 = 0;
     while i < len(s.entries[e].zrows) {
         if bytes_eq(&s.entries[e].zrows[i].member, member) {
@@ -1301,6 +1325,7 @@ fn cmd_zadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
             s.entries[e].zrows[mi as u64].score = sc2;
         } else {
             s.entries[e].zrows.push(ZRow { member: bytes_clone(&args[p + 1]), score: sc2 });
+            midx_note_append(s, e, &args[p + 1]);
             added = added + 1;
         };
         p = p + 2;
@@ -1419,6 +1444,7 @@ fn cmd_zrem(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         let mi: i64 = zset_member_index(s, e, &args[i]);
         if mi >= 0 {
             let dropped_m = s.entries[e].zrows.remove(mi as u64);
+            midx_drop(s, e);
             removed = removed + 1;
         };
         i = i + 1;

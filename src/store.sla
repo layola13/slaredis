@@ -87,6 +87,23 @@ struct Entry {
     lhead: u64,
     smembers: Vec<Vec<u8>>,
     zrows: Vec<ZRow>,
+    // Member index for PLAIN aggregates (knife1, 2026-11-02):
+    // open addressing over the entry kind's member sequence
+    // (smembers for sets, hfields for hashes, zrows[].member
+    // for zsets), mapping member hash -> member position + 1
+    // (0 = empty, MIDX_TOMB = deleted). It exists because the
+    // plain membership tests were linear scans over the member
+    // vector (~0.15-0.35 us per member per op measured: a
+    // 30k-member set paid ~3 ms per SISMEMBER miss and SADD
+    // collapsed to ~1k rps in the 10k-member benchmark scene).
+    // Built lazily by the membership helpers once a payload
+    // reaches MIDX_MIN members, maintained incrementally on
+    // appends, and dropped wholesale on any order-shifting
+    // removal (positions would move; the next lookup rebuilds).
+    // Never serialized: clones/materializations drop it, so
+    // AOF bytes and reply bytes are unaffected.
+    midx: Vec<i64>,
+    midx_tombs: u64,
 }
 
 struct Store {
@@ -121,6 +138,8 @@ fn entry_blank(key: &Vec<u8>, key_hash: u64, kind: u8) -> Entry {
         lhead: 0,
         smembers: Vec::new(),
         zrows: Vec::new(),
+        midx: Vec::new(),
+        midx_tombs: 0,
     };
 }
 
@@ -311,6 +330,202 @@ fn idx_remove(s: &Store, key_hash: u64, ei: u64) {
     }
 }
 
+// ---- member index for PLAIN aggregates (knife1) ----
+//
+// Same open-addressing discipline as the B1 key index, one
+// level down: cells hold member position + 1, 0 is empty,
+// MIDX_TOMB marks a dropped slot (this index has no shifting
+// removals -- a payload removal drops the whole index instead,
+// see midx_drop). Bucket placement reuses bytes_hash + idx_mix.
+// The index is a pure cache of the member vector's contents:
+// every answer it gives is verified by a full byte compare
+// against the member at the cell's position, exactly as
+// idx_probe verifies against the entry key.
+
+const MIDX_TOMB: i64 = -1;
+
+// Payloads smaller than this keep the linear membership scan:
+// the scan's worst case there is a few microseconds and the
+// index's fixed costs (build, memory) would dominate. Packed
+// aggregates convert at 129 logical elements, so plain payloads
+// normally cross this threshold at conversion time.
+const MIDX_MIN: u64 = 32;
+
+// Member count of entry e's plain payload (0 for kinds without
+// a member sequence).
+fn midx_len(s: &Store, e: u64) -> u64 {
+    if s.entries[e].kind == KIND_SET {
+        return len(s.entries[e].smembers);
+    };
+    if s.entries[e].kind == KIND_HASH {
+        return len(s.entries[e].hfields);
+    };
+    if s.entries[e].kind == KIND_ZSET {
+        return len(s.entries[e].zrows);
+    };
+    return 0;
+}
+
+// Full byte compare of the member at position `pos` against
+// `member`, in entry e's kind sequence.
+fn midx_eq_at(s: &Store, e: u64, pos: u64, member: &Vec<u8>) -> bool {
+    if s.entries[e].kind == KIND_SET {
+        return bytes_eq(&s.entries[e].smembers[pos], member);
+    };
+    if s.entries[e].kind == KIND_HASH {
+        return bytes_eq(&s.entries[e].hfields[pos], member);
+    };
+    if s.entries[e].kind == KIND_ZSET {
+        return bytes_eq(&s.entries[e].zrows[pos].member, member);
+    };
+    return false;
+}
+
+// Hash of the member at position `pos` in entry e.
+fn midx_hash_at(s: &Store, e: u64, pos: u64) -> u64 {
+    if s.entries[e].kind == KIND_SET {
+        return bytes_hash(&s.entries[e].smembers[pos]);
+    };
+    if s.entries[e].kind == KIND_HASH {
+        return bytes_hash(&s.entries[e].hfields[pos]);
+    };
+    if s.entries[e].kind == KIND_ZSET {
+        return bytes_hash(&s.entries[e].zrows[pos].member);
+    };
+    return 0;
+}
+
+// Place position `pos` (whose member hash is `mh`) into a
+// built index by hash + byte compare: members are unique, so a
+// compare hit can only be the same member (a duplicate insert
+// keeps the first position, matching scan order).
+fn midx_put(s: &Store, e: u64, mh: u64, pos: u64, member: &Vec<u8>) {
+    let mp_cap: u64 = len(s.entries[e].midx);
+    let mp_mask: u64 = mp_cap - 1;
+    let mp_pos: u64 = idx_mix(mh) & mp_mask;
+    let mp_tomb: i64 = -1;
+    let mp_n: u64 = 0;
+    while mp_n < mp_cap {
+        let mp_cell: i64 = s.entries[e].midx[mp_pos];
+        if mp_cell == 0 {
+            if mp_tomb >= 0 {
+                s.entries[e].midx[mp_tomb as u64] = (pos as i64) + 1;
+                s.entries[e].midx_tombs = s.entries[e].midx_tombs - 1;
+                return;
+            };
+            s.entries[e].midx[mp_pos] = (pos as i64) + 1;
+            return;
+        };
+        if mp_cell == MIDX_TOMB {
+            if mp_tomb < 0 {
+                mp_tomb = mp_pos as i64;
+            };
+        } else {
+            if midx_eq_at(s, e, (mp_cell - 1) as u64, member) {
+                return;
+            };
+        };
+        mp_pos = (mp_pos + 1) & mp_mask;
+        mp_n = mp_n + 1;
+    }
+    if mp_tomb >= 0 {
+        s.entries[e].midx[mp_tomb as u64] = (pos as i64) + 1;
+        s.entries[e].midx_tombs = s.entries[e].midx_tombs - 1;
+    };
+}
+
+// (Re)build entry e's member index from its payload vector.
+fn midx_rebuild(s: &Store, e: u64) {
+    let mr_n: u64 = midx_len(s, e);
+    let mr_fresh: Vec<i64> = Vec::new();
+    let mr_i: u64 = 0;
+    let mr_cap: u64 = idx_cap_for(mr_n);
+    while mr_i < mr_cap {
+        mr_fresh.push(0);
+        mr_i = mr_i + 1;
+    }
+    s.entries[e].midx = mr_fresh;
+    s.entries[e].midx_tombs = 0;
+    let mr_j: u64 = 0;
+    while mr_j < mr_n {
+        // place by hash alone: the compare in midx_put would
+        // need the member as a &Vec<u8> value; members are
+        // unique, so hash placement into empty cells suffices
+        let mh: u64 = midx_hash_at(s, e, mr_j);
+        let mp_mask: u64 = mr_cap - 1;
+        let mp_pos: u64 = idx_mix(mh) & mp_mask;
+        while s.entries[e].midx[mp_pos] != 0 {
+            mp_pos = (mp_pos + 1) & mp_mask;
+        }
+        s.entries[e].midx[mp_pos] = (mr_j as i64) + 1;
+        mr_j = mr_j + 1;
+    }
+}
+
+// Build entry e's member index if it is not built. An empty
+// midx means "not built" (payloads at or past MIDX_MIN build
+// on first use; smaller payloads never call this).
+fn midx_ensure(s: &Store, e: u64) {
+    if len(s.entries[e].midx) == 0 {
+        midx_rebuild(s, e);
+    };
+}
+
+// Probe entry e's built member index for `member`: its position
+// in the member sequence, or -1. Caller guarantees the index is
+// built (midx_ensure) and the payload is at least MIDX_MIN.
+fn midx_find(s: &Store, e: u64, member: &Vec<u8>) -> i64 {
+    let mf_cap: u64 = len(s.entries[e].midx);
+    let mf_mask: u64 = mf_cap - 1;
+    let mf_pos: u64 = idx_mix(bytes_hash(member)) & mf_mask;
+    let mf_n: u64 = 0;
+    while mf_n < mf_cap {
+        let mf_cell: i64 = s.entries[e].midx[mf_pos];
+        if mf_cell == 0 {
+            return -1;
+        };
+        if mf_cell != MIDX_TOMB {
+            let mf_p: u64 = (mf_cell - 1) as u64;
+            if midx_eq_at(s, e, mf_p, member) {
+                return mf_p as i64;
+            };
+        };
+        mf_pos = (mf_pos + 1) & mf_mask;
+        mf_n = mf_n + 1;
+    }
+    return -1;
+}
+
+// Record a just-appended member (now the last position of entry
+// e's payload). No-op when the index is not built, except that
+// crossing the MIDX_MIN threshold builds it; when an insert
+// would push the built index past its load factor the index is
+// rebuilt at the fitted capacity instead.
+fn midx_note_append(s: &Store, e: u64, member: &Vec<u8>) {
+    let na_n: u64 = midx_len(s, e);
+    if len(s.entries[e].midx) == 0 {
+        if na_n >= MIDX_MIN {
+            midx_rebuild(s, e);
+        };
+        return;
+    };
+    let na_cap: u64 = len(s.entries[e].midx);
+    let na_live: u64 = na_n - 1;
+    if (na_live + s.entries[e].midx_tombs + 1) * 10 > na_cap * 7 {
+        midx_rebuild(s, e);
+        return;
+    };
+    midx_put(s, e, bytes_hash(member), na_n - 1, member);
+}
+
+// Drop entry e's member index: the payload just lost or moved a
+// member (a Vec::remove shift), so recorded positions may be
+// stale. The next membership query at or past MIDX_MIN rebuilds.
+fn midx_drop(s: &Store, e: u64) {
+    s.entries[e].midx = Vec::new();
+    s.entries[e].midx_tombs = 0;
+}
+
 // ---- free-slot min-heap (tombstone slot reuse) ----
 //
 // entry_tombstone pushes the freed slot; inserts claim the
@@ -435,6 +650,8 @@ fn entry_tombstone(s: &Store, i: u64) {
     s.entries[i].lhead = 0;
     s.entries[i].smembers = Vec::new();
     s.entries[i].zrows = Vec::new();
+    s.entries[i].midx = Vec::new();
+    s.entries[i].midx_tombs = 0;
     s.dead_count = s.dead_count + 1;
     fh_push(s, i);
 }
@@ -454,6 +671,8 @@ fn entry_reset(s: &Store, i: u64, kind: u8) {
     s.entries[i].lhead = 0;
     s.entries[i].smembers = Vec::new();
     s.entries[i].zrows = Vec::new();
+    s.entries[i].midx = Vec::new();
+    s.entries[i].midx_tombs = 0;
 }
 
 fn entry_expired(s: &Store, i: u64, now_ms: i64) -> bool {
@@ -761,6 +980,8 @@ fn entry_convert_plain(s: &Store, i: u64) {
     s.entries[i].zrows = m.zrows;
     s.entries[i].enc = ENC_PLAIN;
     s.entries[i].pack = Vec::new();
+    s.entries[i].midx = Vec::new();
+    s.entries[i].midx_tombs = 0;
 }
 
 // Active expiry sweep + tombstone compaction. Called periodically

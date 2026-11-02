@@ -50,6 +50,7 @@
 @import "sa_std/fs.sai"
 @import "sa_std/status.sla"
 @import "sa_std/vec.sa"
+@import "sa_std/vec_packed.sla"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "sa_std/thread.sa"
@@ -76,6 +77,19 @@ struct Conn {
     // wait; rewritten for every open connection on every round
     // the wait succeeds, meaningless on rounds it does not.
     ready: u32,
+    // Persistent socket staging (knife1, 2026-11-02): the read
+    // chunk lands in rbuf and the write chunk is staged in wbuf.
+    // These used to be per-call [u8; 4096] locals in conn_read /
+    // conn_flush, and a stack array literal is re-filled over its
+    // FULL size on every declaration (~4 ns/B measured), which
+    // priced out at ~33 of the ~56 us/op shallow-batch service
+    // time. As fields they are zero-filled once per connection;
+    // only the staged chunk's bytes are touched per call. rbuf
+    // contents are consumed (appended to inbuf) inside conn_read
+    // before it returns, wbuf contents are written out inside
+    // conn_flush, so neither carries state across calls.
+    rbuf: [u8; 4096],
+    wbuf: [u8; 4096],
 }
 
 fn conn_new(stream: u64, authed: bool) -> Conn {
@@ -90,6 +104,8 @@ fn conn_new(stream: u64, authed: bool) -> Conn {
         close_after_flush: false,
         authed: authed,
         ready: 0,
+        rbuf: [0u8; 4096],
+        wbuf: [0u8; 4096],
     };
 }
 
@@ -98,8 +114,11 @@ fn conn_read(conns: &Vec<Conn>, i: u64) -> bool {
     if conns[i].eof {
         return false;
     };
-    let buf: [u8; 4096] = [0u8; 4096];
-    let bp: ptr = PTR_BYTE_ADD(&buf, 0);
+    // Read into the connection's persistent staging buffer and
+    // bulk-append the chunk to inbuf through the std packed-import
+    // face (sa_std/vec_packed.sla); the staging bytes are consumed
+    // by the append before this call returns.
+    let bp: ptr = PTR_BYTE_ADD(&conns[i].rbuf, 0);
     let nread: u64 = 0;
     let st: i32 = sa_std_net_tcp_stream_read(conns[i].stream, bp, 4096, &nread);
     if st != SA_STD_OK {
@@ -109,11 +128,8 @@ fn conn_read(conns: &Vec<Conn>, i: u64) -> bool {
         conns[i].eof = true;
         return false;
     };
-    let j: u64 = 0;
-    while j < nread {
-        conns[i].inbuf.push(buf[j]);
-        j = j + 1;
-    }
+    let ib = conns[i].inbuf;
+    conns[i].inbuf = sa_vec_u8_extend_packed(ib, bp, nread);
     return true;
 }
 
@@ -247,13 +263,22 @@ fn conn_flush(conns: &Vec<Conn>, i: u64) -> bool {
     if chunk > 4096 {
         chunk = 4096;
     };
-    let arr: [u8; 4096] = [0u8; 4096];
+    // Stage the chunk in the connection's persistent wbuf (see
+    // the Conn field note: a per-call [u8; 4096] local here cost
+    // a full-size refill on every flush). The staging writes go
+    // through the raw pointer: an index assignment into the field
+    // array whose source is a sibling field place of the same
+    // element (wbuf[j] = outbuf[...]) mislowers in the current
+    // toolchain (minimal repro: knife1 probe_t3, DEF-knife1-t3),
+    // while the ptr form is probe-verified (probe_t3d).
+    let ap: ptr = PTR_BYTE_ADD(&conns[i].wbuf, 0);
     let j: u64 = 0;
     while j < chunk {
-        arr[j] = conns[i].outbuf[conns[i].outoff + j];
+        let dp: ptr = PTR_NULL();
+        PTR_BYTE_ADD(dp, ap, j);
+        PTR_WRITE_U8(dp, conns[i].outbuf[conns[i].outoff + j]);
         j = j + 1;
     }
-    let ap: ptr = PTR_BYTE_ADD(&arr, 0);
     let written: u64 = 0;
     let st: i32 = sa_std_net_tcp_stream_write(conns[i].stream, ap, chunk, &written);
     if st != SA_STD_OK {
@@ -555,6 +580,12 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: Ao
                             close_after_flush: conns[m].close_after_flush,
                             authed: conns[m].authed,
                             ready: conns[m].ready,
+                            // staging contents are transient
+                            // (consumed inside conn_read /
+                            // conn_flush), so a reap between
+                            // rounds restarts them zeroed
+                            rbuf: [0u8; 4096],
+                            wbuf: [0u8; 4096],
                         });
                     };
                     m = m + 1;
