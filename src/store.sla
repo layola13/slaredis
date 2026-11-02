@@ -279,14 +279,36 @@ fn idx_insert(s: &Store, key: &Vec<u8>, key_hash: u64, ei: u64) {
     s.index[ii_pos] = (ei as i64) + 1;
 }
 
-// Drop `key` from the index, leaving a tombstone cell so probe
-// chains that pass through it stay intact.
-fn idx_remove(s: &Store, key: &Vec<u8>, key_hash: u64) {
-    let (ir_found, ir_pos) = idx_probe(s, key, key_hash);
-    if ir_found >= 0 {
-        s.index[ir_pos] = IDX_TOMB;
-        s.index_tombs = s.index_tombs + 1;
+// Drop entry `ei` from the index, leaving a tombstone cell so probe
+// chains that pass through it stay intact. Located by entry index
+// alone (cells hold ei+1, unique per live entry), so the caller
+// never has to borrow the entry key alongside the store -- this
+// keeps entry_tombstone's borrow of `s` conflict-free. A probe
+// that reaches an empty cell without seeing ei+1 means the entry
+// is not indexed (e.g. repointed by a duplicate insert); that is
+// a no-op, matching the old key-based form's miss behaviour.
+fn idx_remove(s: &Store, key_hash: u64, ei: u64) {
+    let ir_cap: u64 = len(s.index);
+    if ir_cap == 0 {
+        return;
     };
+    let ir_mask: u64 = ir_cap - 1;
+    let ir_want: i64 = (ei as i64) + 1;
+    let ir_pos: u64 = idx_mix(key_hash) & ir_mask;
+    let ir_n: u64 = 0;
+    while ir_n < ir_cap {
+        let ir_cell: i64 = s.index[ir_pos];
+        if ir_cell == 0 {
+            return;
+        };
+        if ir_cell == ir_want {
+            s.index[ir_pos] = IDX_TOMB;
+            s.index_tombs = s.index_tombs + 1;
+            return;
+        };
+        ir_pos = (ir_pos + 1) & ir_mask;
+        ir_n = ir_n + 1;
+    }
 }
 
 // ---- free-slot min-heap (tombstone slot reuse) ----
@@ -401,7 +423,7 @@ fn entry_tombstone(s: &Store, i: u64) {
     if s.entries[i].kind == KIND_DEAD {
         return;
     };
-    idx_remove(s, &s.entries[i].key, s.entries[i].key_hash);
+    idx_remove(s, s.entries[i].key_hash, i);
     s.entries[i].kind = KIND_DEAD;
     s.entries[i].expire_ms = 0;
     s.entries[i].enc = ENC_PLAIN;
