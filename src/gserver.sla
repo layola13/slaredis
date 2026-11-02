@@ -241,6 +241,18 @@ struct SrvCtx {
     // result they wait for.
     aof_broken: bool,
     yield_every: u64,
+    // Instrument (2026-11-02, expert-review ruling): g_try_inline
+    // hit/miss counters -- a hit is a command executed inline in
+    // its connection goroutine, a miss is any fall-back to the
+    // executor batch (batch pending, rewrite command, try-lock
+    // contention, write-path refusal). Plain u64s incremented by
+    // connection goroutines without synchronisation (the same
+    // assumption family as core_dead/aof_broken above): under
+    // contention an increment can be lost, so the pair is a
+    // decision instrument, not an audit ledger. Read out with
+    // the INLINESTATS command (g_conn_step).
+    inline_hit: u64,
+    inline_miss: u64,
 }
 
 struct CmdReq {
@@ -993,6 +1005,25 @@ fn g_try_inline_write(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
 // batch done wait), the sync lands, the pass finishes, the
 // emit drains into a dead out queue the driver discards,
 // and the end-of-stream pass closes the connection cleanly.
+// INLINESTATS instrument readout: recognised in g_conn_step
+// (the AUTH precedent -- handled by the connection layer, never
+// routed to the store, and not itself counted as hit or miss).
+fn g_is_inlinestats_command(args: &Vec<Vec<u8>>) -> bool {
+    if len(args) == 0 {
+        return false;
+    };
+    return bytes_eq_lit_ci(&args[0], STR_PTR("INLINESTATS"), STR_LEN("INLINESTATS"));
+}
+
+fn g_inlinestats_reply(ctx: *SrvCtx) -> Vec<u8> {
+    let p0: Vec<u8> = Vec::new();
+    let p1 = bytes_push_lit(p0, STR_PTR("inline_hit="), STR_LEN("inline_hit="));
+    let p2 = append_i64(p1, (*ctx).inline_hit as i64);
+    let p3 = bytes_push_lit(p2, STR_PTR(" inline_miss="), STR_LEN(" inline_miss="));
+    let p4 = append_i64(p3, (*ctx).inline_miss as i64);
+    return resp_bulk(Vec::new(), &p4);
+}
+
 fn g_inline_wait(job: *ConnJob) {
     let ctx = (*job).ctx;
     let i: u64 = 0;
@@ -1162,8 +1193,18 @@ fn g_conn_step(job: *ConnJob) -> bool {
                             (*job).auth_ok_pending = false;
                         };
                     } else {
-                        if g_try_inline(job, &pr.args) != true {
-                            (*(*job).req).batch.push(g_clone_args(&pr.args));
+                        if g_is_inlinestats_command(&pr.args) {
+                            g_flush_batch(job);
+                            g_seg_push(job, g_inlinestats_reply((*job).ctx));
+                        } else {
+                            let inl_ok = g_try_inline(job, &pr.args);
+                            if inl_ok {
+                                (*(*job).ctx).inline_hit = (*(*job).ctx).inline_hit + 1;
+                            };
+                            if inl_ok != true {
+                                (*(*job).ctx).inline_miss = (*(*job).ctx).inline_miss + 1;
+                                (*(*job).req).batch.push(g_clone_args(&pr.args));
+                            };
                         };
                     };
                 };
@@ -2228,6 +2269,8 @@ fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig
         core_dead: false,
         aof_broken: false,
         yield_every: yield_every,
+        inline_hit: 0,
+        inline_miss: 0,
     }));
     // Spawn order: consumers first, the IO driver last, so no
     // connection can be accepted before its executor exists.
