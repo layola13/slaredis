@@ -143,6 +143,26 @@ fn entry_blank(key: &Vec<u8>, key_hash: u64, kind: u8) -> Entry {
     };
 }
 
+fn entry_blank_owned(key: Vec<u8>, key_hash: u64, kind: u8) -> Entry {
+    return Entry {
+        key: key,
+        key_hash: key_hash,
+        kind: kind,
+        expire_ms: 0,
+        enc: ENC_PLAIN,
+        pack: Vec::new(),
+        sval: Vec::new(),
+        hfields: Vec::new(),
+        hvalues: Vec::new(),
+        litems: Vec::new(),
+        lhead: 0,
+        smembers: Vec::new(),
+        zrows: Vec::new(),
+        midx: Vec::new(),
+        midx_tombs: 0,
+    };
+}
+
 fn store_new() -> Store {
     return Store {
         entries: Vec::new(),
@@ -518,6 +538,112 @@ fn midx_note_append(s: &Store, e: u64, member: &Vec<u8>) {
     midx_put(s, e, bytes_hash(member), na_n - 1, member);
 }
 
+// Byte equality of two payload elements of entry e, by
+// position, using value reads only (knife2): the owned-args
+// insert path cannot pass the just-appended member as a
+// &Vec<u8> alongside `s` (BorrowConflict), so the self-
+// referential index maintenance below compares positions
+// inside the payload instead.
+fn midx_eq_pos(s: &Store, e: u64, a: u64, b: u64) -> bool {
+    if s.entries[e].kind == KIND_SET {
+        if len(s.entries[e].smembers[a]) != len(s.entries[e].smembers[b]) {
+            return false;
+        };
+        let i: u64 = 0;
+        while i < len(s.entries[e].smembers[a]) {
+            if s.entries[e].smembers[a][i] != s.entries[e].smembers[b][i] {
+                return false;
+            };
+            i = i + 1;
+        }
+        return true;
+    };
+    if s.entries[e].kind == KIND_HASH {
+        if len(s.entries[e].hfields[a]) != len(s.entries[e].hfields[b]) {
+            return false;
+        };
+        let i2: u64 = 0;
+        while i2 < len(s.entries[e].hfields[a]) {
+            if s.entries[e].hfields[a][i2] != s.entries[e].hfields[b][i2] {
+                return false;
+            };
+            i2 = i2 + 1;
+        }
+        return true;
+    };
+    if s.entries[e].kind == KIND_ZSET {
+        if len(s.entries[e].zrows[a].member) != len(s.entries[e].zrows[b].member) {
+            return false;
+        };
+        let i3: u64 = 0;
+        while i3 < len(s.entries[e].zrows[a].member) {
+            if s.entries[e].zrows[a].member[i3] != s.entries[e].zrows[b].member[i3] {
+                return false;
+            };
+            i3 = i3 + 1;
+        }
+        return true;
+    };
+    return false;
+}
+
+// midx_put with the member identified by its payload position
+// (collision checks go through midx_eq_pos).
+fn midx_put_last(s: &Store, e: u64, mh: u64, pos: u64) {
+    let mp_cap: u64 = len(s.entries[e].midx);
+    let mp_mask: u64 = mp_cap - 1;
+    let mp_pos: u64 = idx_mix(mh) & mp_mask;
+    let mp_tomb: i64 = -1;
+    let mp_n: u64 = 0;
+    while mp_n < mp_cap {
+        let mp_cell: i64 = s.entries[e].midx[mp_pos];
+        if mp_cell == 0 {
+            if mp_tomb >= 0 {
+                s.entries[e].midx[mp_tomb as u64] = (pos as i64) + 1;
+                s.entries[e].midx_tombs = s.entries[e].midx_tombs - 1;
+                return;
+            };
+            s.entries[e].midx[mp_pos] = (pos as i64) + 1;
+            return;
+        };
+        if mp_cell == MIDX_TOMB {
+            if mp_tomb < 0 {
+                mp_tomb = mp_pos as i64;
+            };
+        } else {
+            if midx_eq_pos(s, e, (mp_cell - 1) as u64, pos) {
+                return;
+            };
+        };
+        mp_pos = (mp_pos + 1) & mp_mask;
+        mp_n = mp_n + 1;
+    }
+    if mp_tomb >= 0 {
+        s.entries[e].midx[mp_tomb as u64] = (pos as i64) + 1;
+        s.entries[e].midx_tombs = s.entries[e].midx_tombs - 1;
+    };
+}
+
+// midx_note_append for a member that already sits at the last
+// payload position (the owned-args insert path moved it there
+// and cannot lend it back out alongside `s`).
+fn midx_note_append_last(s: &Store, e: u64) {
+    let na_n: u64 = midx_len(s, e);
+    if len(s.entries[e].midx) == 0 {
+        if na_n >= MIDX_MIN {
+            midx_rebuild(s, e);
+        };
+        return;
+    };
+    let na_cap: u64 = len(s.entries[e].midx);
+    let na_live: u64 = na_n - 1;
+    if (na_live + s.entries[e].midx_tombs + 1) * 10 > na_cap * 7 {
+        midx_rebuild(s, e);
+        return;
+    };
+    midx_put_last(s, e, midx_hash_at(s, e, na_n - 1), na_n - 1);
+}
+
 // Drop entry e's member index: the payload just lost or moved a
 // member (a Vec::remove shift), so recorded positions may be
 // stale. The next membership query at or past MIDX_MIN rebuilds.
@@ -812,6 +938,31 @@ fn store_insert_at(s: &Store, key: &Vec<u8>, key_hash: u64, kind: u8, dead: i64)
     s.entries.push(entry_blank(key, key_hash, kind));
     let ni: u64 = len(s.entries) - 1;
     idx_insert(s, key, key_hash, ni);
+    return ni as i64;
+}
+
+// store_insert_at with the key buffer MOVED into the blank
+// entry (knife2 owned-args path): the caller parsed the key
+// into its own buffer already, so the entry takes it over
+// instead of cloning it. idx_insert runs on the local key
+// before the move (it only probes the table -- growth is
+// idx_ensure's job, already done above), because the checker
+// forbids borrowing the placed entry's key alongside `s` in
+// one call; the cell it writes names the slot the entry is
+// about to occupy, and nothing reads the index in between.
+fn store_insert_at_owned(s: &Store, key: Vec<u8>, key_hash: u64, kind: u8, dead: i64) -> i64 {
+    idx_ensure(s);
+    if dead >= 0 {
+        let d: u64 = dead as u64;
+        fh_discard(s, d);
+        idx_insert(s, &key, key_hash, d);
+        s.entries[d] = entry_blank_owned(key, key_hash, kind);
+        s.dead_count = s.dead_count - 1;
+        return dead;
+    };
+    let ni: u64 = len(s.entries);
+    idx_insert(s, &key, key_hash, ni);
+    s.entries.push(entry_blank_owned(key, key_hash, kind));
     return ni as i64;
 }
 

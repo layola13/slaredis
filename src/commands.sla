@@ -228,6 +228,72 @@ fn cmd_set(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8>
     return resp_simple(out, STR_PTR("OK"), STR_LEN("OK"));
 }
 
+// Owned-args SET (knife2): identical semantics to cmd_set, but
+// the value buffer -- and, on insert, the key buffer -- that
+// resp_parse materialized is MOVED into the entry instead of
+// cloned a second time. All validation runs on borrows before
+// any buffer is extracted, so error exits return the args
+// untouched. Used only by the poll server loop through
+// exec_command_move; AOF replay keeps the borrowing cmd_set.
+fn cmd_set_owned(s: &Store, args: Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> (Vec<Vec<u8>>, Vec<u8>) {
+    if len(args) < 3 {
+        return (args, err_arity(out, STR_PTR("set"), STR_LEN("set")));
+    };
+    let deadline: i64 = 0;
+    let i: u64 = 3;
+    while i < len(args) {
+        if bytes_eq_lit_ci(&args[i], STR_PTR("EX"), STR_LEN("EX")) {
+            if deadline != 0 {
+                return (args, err_syntax(out));
+            };
+            if i + 1 >= len(args) {
+                return (args, err_syntax(out));
+            };
+            let (ok, sec) = parse_i64_full(&args[i + 1]);
+            if ok != true || sec <= 0 {
+                return (args, err_invalid_expire_set(out));
+            };
+            if sec > 9223372036854775807 / 1000 {
+                deadline = 9223372036854775807;
+            } else {
+                deadline = expire_deadline(now_ms, sec * 1000);
+            };
+            i = i + 2;
+        } else {
+            if bytes_eq_lit_ci(&args[i], STR_PTR("PX"), STR_LEN("PX")) {
+                if deadline != 0 {
+                    return (args, err_syntax(out));
+                };
+                if i + 1 >= len(args) {
+                    return (args, err_syntax(out));
+                };
+                let (ok2, ms) = parse_i64_full(&args[i + 1]);
+                if ok2 != true || ms <= 0 {
+                    return (args, err_invalid_expire_set(out));
+                };
+                deadline = expire_deadline(now_ms, ms);
+                i = i + 2;
+            } else {
+                return (args, err_syntax(out));
+            };
+        };
+    }
+    let hash: u64 = bytes_hash(&args[1]);
+    let (idx, dead) = store_find_slot(s, &args[1], hash, now_ms);
+    let val = args.remove(2);
+    let slot: u64 = 0;
+    if idx >= 0 {
+        slot = idx as u64;
+        entry_reset(s, slot, KIND_STRING);
+    } else {
+        let key = args.remove(1);
+        slot = store_insert_at_owned(s, key, hash, KIND_STRING, dead) as u64;
+    };
+    s.entries[slot].sval = val;
+    s.entries[slot].expire_ms = deadline;
+    return (args, resp_simple(out, STR_PTR("OK"), STR_LEN("OK")));
+}
+
 fn cmd_get(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
     if len(args) != 2 {
         return err_arity(out, STR_PTR("get"), STR_LEN("get"));
@@ -579,6 +645,88 @@ fn cmd_hset(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         i = i + 2;
     }
     return resp_int(out, added);
+}
+
+// Owned-args HSET (knife2): identical semantics to cmd_hset.
+// The packed paths only read the args; the plain path MOVES
+// each field/value buffer into the entry instead of cloning
+// it (pairs are consumed at the head of the args tail, so the
+// next pair always sits at positions 2 and 3). The member
+// index is maintained through midx_note_append_last, the
+// by-position variant in store.sla.
+fn cmd_hset_owned(s: &Store, args: Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> (Vec<Vec<u8>>, Vec<u8>) {
+    if len(args) < 4 || len(args) % 2 != 0 {
+        return (args, err_arity(out, STR_PTR("hset"), STR_LEN("hset")));
+    };
+    let idx: i64 = lookup_or_create_agg(s, &args[1], KIND_HASH, now_ms);
+    if idx == -2 {
+        return (args, err_wrongtype(out));
+    };
+    let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        let convert: bool = pack_args_have_big(&args, 2);
+        if convert != true {
+            let newf: u64 = 0;
+            let j: u64 = 2;
+            while j < len(args) {
+                if pack_pair_pos(&s.entries[e].pack, &args[j]) < 0 {
+                    let seen: bool = false;
+                    let k: u64 = 2;
+                    while k < j {
+                        if bytes_eq_elems(&args, k, j) {
+                            seen = true;
+                        };
+                        k = k + 2;
+                    }
+                    if seen != true {
+                        newf = newf + 1;
+                    };
+                };
+                j = j + 2;
+            }
+            if pack_logical_count(s, e) + newf > PACK_MAX_LOGICAL {
+                convert = true;
+            };
+        };
+        if convert {
+            entry_convert_plain(s, e);
+        } else {
+            let addedp: i64 = 0;
+            let i2: u64 = 2;
+            while i2 < len(args) {
+                let fpos: i64 = pack_pair_pos(&s.entries[e].pack, &args[i2]);
+                if fpos >= 0 {
+                    let vpos: u64 = lp_next(&s.entries[e].pack, fpos as u64);
+                    let pk = s.entries[e].pack;
+                    s.entries[e].pack = lp_replace(pk, vpos, &args[i2 + 1]);
+                } else {
+                    let pk2 = s.entries[e].pack;
+                    let pk3 = lp_append(pk2, &args[i2]);
+                    s.entries[e].pack = lp_append(pk3, &args[i2 + 1]);
+                    addedp = addedp + 1;
+                };
+                i2 = i2 + 2;
+            }
+            return (args, resp_int(out, addedp));
+        };
+    };
+    let added: i64 = 0;
+    while len(args) > 2 {
+        let fi: i64 = hash_field_index(s, e, &args[2]);
+        if fi >= 0 {
+            let v = args.remove(3);
+            s.entries[e].hvalues[fi as u64] = v;
+            let dropped_f = args.remove(2);
+        } else {
+            let v2 = args.remove(3);
+            let f2 = args.remove(2);
+            s.entries[e].hfields.push(f2);
+            s.entries[e].hvalues.push(v2);
+            midx_note_append_last(s, e);
+            added = added + 1;
+        };
+    }
+    return (args, resp_int(out, added));
 }
 
 fn cmd_hget(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
@@ -1003,6 +1151,78 @@ fn cmd_sadd(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8
         i = i + 1;
     }
     return resp_int(out, added);
+}
+
+// Owned-args SADD (knife2): identical semantics to cmd_sadd.
+// The packed path only reads the args; the plain path MOVES
+// each new member buffer into the entry instead of cloning it
+// (members are consumed at the head of the args tail, so the
+// next candidate always sits at position 2; a duplicate is
+// extracted and dropped). The member index is maintained
+// through midx_note_append_last, the by-position variant in
+// store.sla.
+fn cmd_sadd_owned(s: &Store, args: Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> (Vec<Vec<u8>>, Vec<u8>) {
+    if len(args) < 3 {
+        return (args, err_arity(out, STR_PTR("sadd"), STR_LEN("sadd")));
+    };
+    let idx: i64 = lookup_or_create_agg(s, &args[1], KIND_SET, now_ms);
+    if idx == -2 {
+        return (args, err_wrongtype(out));
+    };
+    let e: u64 = idx as u64;
+    if s.entries[e].enc == ENC_PACKED {
+        let convert: bool = pack_args_have_big(&args, 2);
+        if convert != true {
+            let newm: u64 = 0;
+            let j: u64 = 2;
+            while j < len(args) {
+                if lp_find(&s.entries[e].pack, &args[j]) < 0 {
+                    let seen: bool = false;
+                    let k: u64 = 2;
+                    while k < j {
+                        if bytes_eq_elems(&args, k, j) {
+                            seen = true;
+                        };
+                        k = k + 1;
+                    }
+                    if seen != true {
+                        newm = newm + 1;
+                    };
+                };
+                j = j + 1;
+            }
+            if pack_logical_count(s, e) + newm > PACK_MAX_LOGICAL {
+                convert = true;
+            };
+        };
+        if convert {
+            entry_convert_plain(s, e);
+        } else {
+            let addedp: i64 = 0;
+            let i2: u64 = 2;
+            while i2 < len(args) {
+                if lp_find(&s.entries[e].pack, &args[i2]) < 0 {
+                    let pk = s.entries[e].pack;
+                    s.entries[e].pack = lp_append(pk, &args[i2]);
+                    addedp = addedp + 1;
+                };
+                i2 = i2 + 1;
+            }
+            return (args, resp_int(out, addedp));
+        };
+    };
+    let added: i64 = 0;
+    while len(args) > 2 {
+        if set_member_index(s, e, &args[2]) < 0 {
+            let m = args.remove(2);
+            s.entries[e].smembers.push(m);
+            midx_note_append_last(s, e);
+            added = added + 1;
+        } else {
+            let dropped_m = args.remove(2);
+        };
+    }
+    return (args, resp_int(out, added));
 }
 
 fn cmd_srem(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Vec<u8> {
@@ -1561,4 +1781,29 @@ fn exec_command(s: &Store, args: &Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> Ve
         return cmd_zrem(s, args, now_ms, out);
     };
     return err_unknown(out, &args[0]);
+}
+
+// Owned-args dispatch for the poll server loop (knife2): SET,
+// HSET and SADD route to their *_owned variants, which move
+// the argument buffers resp_parse materialized straight into
+// the store instead of cloning them a second time. Every
+// other command borrows the args and runs through
+// exec_command unchanged. The args husk is returned so the
+// caller drops whatever the store did not take. (AOF replay
+// and the goroutine driver keep calling exec_command: their
+// args ownership is not this function's to consume.)
+fn exec_command_move(s: &Store, args: Vec<Vec<u8>>, now_ms: i64, out: Vec<u8>) -> (Vec<Vec<u8>>, Vec<u8>) {
+    if len(args) > 0 {
+        if bytes_eq_lit_ci(&args[0], STR_PTR("SET"), STR_LEN("SET")) {
+            return cmd_set_owned(s, args, now_ms, out);
+        };
+        if bytes_eq_lit_ci(&args[0], STR_PTR("HSET"), STR_LEN("HSET")) {
+            return cmd_hset_owned(s, args, now_ms, out);
+        };
+        if bytes_eq_lit_ci(&args[0], STR_PTR("SADD"), STR_LEN("SADD")) {
+            return cmd_sadd_owned(s, args, now_ms, out);
+        };
+    };
+    let o2 = exec_command(s, &args, now_ms, out);
+    return (args, o2);
 }

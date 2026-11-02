@@ -5,10 +5,27 @@
 // over nonblocking sockets -- the same shape as Redis itself, so a
 // command always executes atomically and the store needs no lock.
 // The loop: wait for readiness, drain pending accepts, then for
-// each connection pump one read chunk, execute every complete
-// command in its buffer, flush its out buffer, and reap
-// connections that are done. The expiry sweeper runs inside the
-// loop every ~100 ms.
+// each connection drain its socket into its input buffer, execute
+// every complete command in its buffer, flush its out buffer, and
+// reap connections that are done. The expiry sweeper runs inside
+// the loop every ~100 ms.
+//
+// Batch form (knife2, 2026-11-02): a round is work-driven, not
+// slice-driven. The pre-knife2 loop read ONE 4096B chunk and
+// wrote ONE 4096B chunk per connection per sweep, so a pipelined
+// burst was metered out one slice per sweep and a round's length
+// was set by the sweep structure rather than by the work in it
+// (measured: p50 at 50 pipelining clients ~= the full sweep time,
+// ~1 ms). Now conn_read drains until the socket would block (a
+// short chunk counts as drained: a stream read that returns less
+// than requested has emptied the kernel buffer) and conn_flush
+// writes until the out buffer is empty or the socket would
+// block, each bounded by a per-round chunk cap so one greedy
+// connection cannot hold the sweep hostage. When a cap is hit
+// the leftover work makes the NEXT round's wait budget zero:
+// the readiness wait exists to sleep through idleness, never to
+// pace work that is already here, so a capped connection costs
+// one extra sweep, never a wait cycle.
 //
 // The wait is a blocking poll (sa_std_net_poll_wait, the F-perf-1
 // readiness face): the M0/M1 loop scanned every socket each round
@@ -109,28 +126,57 @@ fn conn_new(stream: u64, authed: bool) -> Conn {
     };
 }
 
-// One read pump on conns[i]. Returns true when bytes arrived.
-fn conn_read(conns: &Vec<Conn>, i: u64) -> bool {
+// Per-round batch caps (knife2): the most read chunks (4096B
+// each) drained from one connection, and the most write chunks
+// pushed to one connection, in a single sweep. The caps are
+// fairness bounds, not pacing: hitting one marks the round's
+// leftover work (work_left in run_server), which zeroes the
+// next round's wait budget.
+const DRAIN_MAX_CHUNKS: u64 = 16;
+const FLUSH_MAX_CHUNKS: u64 = 16;
+
+// Read pump on conns[i]: drain the socket into the connection's
+// input buffer until the socket would block (a non-OK read
+// status), the peer closes (a zero read), a short chunk reports
+// the kernel buffer empty for now, or the per-round cap is hit.
+// Returns (bytes arrived, stopped by the cap with a full chunk
+// in hand -- more input may already be queued). The chunk lands
+// in the connection's persistent staging buffer and is
+// bulk-appended to inbuf through the std packed-import face
+// (sa_std/vec_packed.sla) before the next chunk is read.
+fn conn_read(conns: &Vec<Conn>, i: u64) -> (bool, bool) {
     if conns[i].eof {
-        return false;
+        return (false, false);
     };
-    // Read into the connection's persistent staging buffer and
-    // bulk-append the chunk to inbuf through the std packed-import
-    // face (sa_std/vec_packed.sla); the staging bytes are consumed
-    // by the append before this call returns.
+    // Hoisted once, as in poll_wait_round: the staging address
+    // is stable across the drain (the loop mutates the inbuf
+    // field, never the connection slot itself).
     let bp: ptr = PTR_BYTE_ADD(&conns[i].rbuf, 0);
-    let nread: u64 = 0;
-    let st: i32 = sa_std_net_tcp_stream_read(conns[i].stream, bp, 4096, &nread);
-    if st != SA_STD_OK {
-        return false;
+    let got: bool = false;
+    let chunks: u64 = 0;
+    while chunks < DRAIN_MAX_CHUNKS {
+        let nread: u64 = 0;
+        let st: i32 = sa_std_net_tcp_stream_read(conns[i].stream, bp, 4096, &nread);
+        if st != SA_STD_OK {
+            break;
+        };
+        if nread == 0 {
+            conns[i].eof = true;
+            break;
+        };
+        let ib = conns[i].inbuf;
+        conns[i].inbuf = sa_vec_u8_extend_packed(ib, bp, nread);
+        got = true;
+        chunks = chunks + 1;
+        if nread < 4096 {
+            break;
+        };
+    }
+    let capped: bool = false;
+    if chunks >= DRAIN_MAX_CHUNKS {
+        capped = got;
     };
-    if nread == 0 {
-        conns[i].eof = true;
-        return false;
-    };
-    let ib = conns[i].inbuf;
-    conns[i].inbuf = sa_vec_u8_extend_packed(ib, bp, nread);
-    return true;
+    return (got, capped);
 }
 
 // Execute every complete command buffered on conns[i], appending
@@ -211,14 +257,26 @@ fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64, auth: &AuthC
                         } else {
                             let ob6 = conns[i].outbuf;
                             let before: u64 = len(ob6);
-                            let ob7 = exec_command(s, &pr.args, now_ms, ob6);
+                            // The AOF record is serialized BEFORE
+                            // dispatch (knife2): the owned-args
+                            // dispatch may move argument buffers
+                            // into the store, so the record is built
+                            // from the intact args here and staged
+                            // on exactly the same success condition
+                            // as before (the reply grew past `before`
+                            // and its first byte is not '-').
+                            let rec_pre: Vec<u8> = Vec::new();
+                            if is_write {
+                                rec_pre = journal_record(&pr.args, now_ms);
+                            };
+                            let args_mv = pr.args;
+                            let (args_back, ob7) = exec_command_move(s, args_mv, now_ms, ob6);
                             conns[i].outbuf = ob7;
                             ran = true;
                             if is_write {
                                 if len(conns[i].outbuf) > before {
                                     if conns[i].outbuf[before] != 45 {
-                                        let rec = journal_record(&pr.args, now_ms);
-                                        aof.pending.push(rec);
+                                        aof.pending.push(rec_pre);
                                     };
                                 };
                             };
@@ -245,7 +303,7 @@ fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64, auth: &AuthC
     } else {
         if conns[i].inoff >= 8192 {
             let rest: Vec<u8> = Vec::new();
-            let rest2 = bytes_push_range(rest, &conns[i].inbuf, conns[i].inoff, len(conns[i].inbuf));
+            let rest2 = sa_vec_u8_extend_from_vec(rest, &conns[i].inbuf, conns[i].inoff, len(conns[i].inbuf) - conns[i].inoff);
             conns[i].inbuf = rest2;
             conns[i].inoff = 0;
         };
@@ -253,46 +311,65 @@ fn conn_exec_all(s: &Store, conns: &Vec<Conn>, i: u64, now_ms: i64, auth: &AuthC
     return ran;
 }
 
-// One write flush on conns[i]. Returns true when bytes were sent.
-fn conn_flush(conns: &Vec<Conn>, i: u64) -> bool {
-    if conns[i].outoff >= len(conns[i].outbuf) {
-        return false;
-    };
-    let avail: u64 = len(conns[i].outbuf) - conns[i].outoff;
-    let chunk: u64 = avail;
-    if chunk > 4096 {
-        chunk = 4096;
-    };
-    // Stage the chunk in the connection's persistent wbuf (see
-    // the Conn field note: a per-call [u8; 4096] local here cost
-    // a full-size refill on every flush). The staging writes go
-    // through the raw pointer: an index assignment into the field
-    // array whose source is a sibling field place of the same
-    // element (wbuf[j] = outbuf[...]) mislowers in the current
-    // toolchain (minimal repro: knife1 probe_t3, DEF-knife1-t3),
-    // while the ptr form is probe-verified (probe_t3d).
-    let ap: ptr = PTR_BYTE_ADD(&conns[i].wbuf, 0);
-    let j: u64 = 0;
-    while j < chunk {
-        let dp: ptr = PTR_NULL();
-        PTR_BYTE_ADD(dp, ap, j);
-        PTR_WRITE_U8(dp, conns[i].outbuf[conns[i].outoff + j]);
-        j = j + 1;
+// Write flush on conns[i]: push the out buffer onto the socket
+// until it is fully written, the socket would block (a non-OK
+// status or a zero write), or the per-round cap is hit. Returns
+// (bytes were sent, out buffer still pending because the cap
+// stopped the loop). Each chunk is staged through the
+// connection's persistent wbuf (see the Conn field note).
+fn conn_flush(conns: &Vec<Conn>, i: u64) -> (bool, bool) {
+    let sent: bool = false;
+    let chunks: u64 = 0;
+    while conns[i].outoff < len(conns[i].outbuf) {
+        if chunks >= FLUSH_MAX_CHUNKS {
+            break;
+        };
+        let avail: u64 = len(conns[i].outbuf) - conns[i].outoff;
+        let chunk: u64 = avail;
+        if chunk > 4096 {
+            chunk = 4096;
+        };
+        // Stage the chunk in the connection's persistent wbuf
+        // (see the Conn field note: a per-call [u8; 4096] local
+        // here cost a full-size refill on every flush). The
+        // staging writes go through the raw pointer: an index
+        // assignment into the field array whose source is a
+        // sibling field place of the same element (wbuf[j] =
+        // outbuf[...]) mislowers in the current toolchain
+        // (minimal repro: knife1 probe_t3, DEF-knife1-t3), while
+        // the ptr form is probe-verified (probe_t3d).
+        let ap: ptr = PTR_BYTE_ADD(&conns[i].wbuf, 0);
+        let j: u64 = 0;
+        while j < chunk {
+            let dp: ptr = PTR_NULL();
+            PTR_BYTE_ADD(dp, ap, j);
+            PTR_WRITE_U8(dp, conns[i].outbuf[conns[i].outoff + j]);
+            j = j + 1;
+        }
+        let written: u64 = 0;
+        let st: i32 = sa_std_net_tcp_stream_write(conns[i].stream, ap, chunk, &written);
+        if st != SA_STD_OK {
+            break;
+        };
+        if written == 0 {
+            break;
+        };
+        conns[i].outoff = conns[i].outoff + written;
+        sent = true;
+        chunks = chunks + 1;
     }
-    let written: u64 = 0;
-    let st: i32 = sa_std_net_tcp_stream_write(conns[i].stream, ap, chunk, &written);
-    if st != SA_STD_OK {
-        return false;
+    let pending: bool = false;
+    if sent {
+        if conns[i].outoff >= len(conns[i].outbuf) {
+            conns[i].outbuf = Vec::new();
+            conns[i].outoff = 0;
+        } else {
+            if chunks >= FLUSH_MAX_CHUNKS {
+                pending = true;
+            };
+        };
     };
-    if written == 0 {
-        return false;
-    };
-    conns[i].outoff = conns[i].outoff + written;
-    if conns[i].outoff == len(conns[i].outbuf) {
-        conns[i].outbuf = Vec::new();
-        conns[i].outoff = 0;
-    };
-    return true;
+    return (sent, pending);
 }
 
 fn conn_drained(conns: &Vec<Conn>, i: u64) -> bool {
@@ -478,6 +555,12 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: Ao
     };
     let conns: Vec<Conn> = Vec::new();
     let last_sweep: i64 = sa_time_unix_ms();
+    // Leftover batch work from the previous round (a drain or
+    // flush stopped by its per-round cap): while it exists the
+    // wait budget is zero, so rounds run back to back until the
+    // leftover is worked off -- the budget paces idleness (the
+    // sweep / fsync deadlines in poll_wait_budget), never work.
+    let work_left: bool = false;
     while true {
         // The round opens with the readiness wait (see the
         // header comment): it blocks until something is ready
@@ -486,6 +569,10 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: Ao
         // accepted below it are read unconditionally this round.
         let wait_now: i64 = sa_time_unix_ms();
         let budget: i32 = poll_wait_budget(wait_now, last_sweep, &aof);
+        if work_left {
+            budget = 0;
+        };
+        work_left = false;
         let (pst, lis_ready) = poll_wait_round(listener, &conns, budget);
         let poll_ok: bool = pst == SA_STD_OK;
         let polled_len: u64 = len(conns);
@@ -528,9 +615,13 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: Ao
                 };
                 let rd: bool = false;
                 if (rbits & (SA_NET_POLL_READ + SA_NET_POLL_ERROR)) != 0 {
-                    rd = conn_read(&conns, ci);
+                    let (got_rd, rd_cap) = conn_read(&conns, ci);
+                    rd = got_rd;
                     if rd {
                         progress = true;
+                    };
+                    if rd_cap {
+                        work_left = true;
                     };
                 };
                 // execute when this round brought bytes, when
@@ -542,8 +633,12 @@ fn run_server(s: &Store, host: Vec<u8>, port: u32, auth: AuthConfig, aof_cfg: Ao
                         progress = true;
                     };
                 };
-                if conn_flush(&conns, ci) {
+                let (sent_fl, fl_cap) = conn_flush(&conns, ci);
+                if sent_fl {
                     progress = true;
+                };
+                if fl_cap {
+                    work_left = true;
                 };
                 if conn_drained(&conns, ci) {
                     if conns[ci].eof || conns[ci].close_after_flush {

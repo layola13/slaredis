@@ -14,6 +14,7 @@
 @import "sa_std/vec.sa"
 @import "sa_std/ptr.sa"
 @import "sa_std/core/slice.sa"
+@import "sa_std/vec_packed.sla"
 @import "bytes.sla"
 
 const PARSE_OK: i32 = 0;
@@ -115,7 +116,7 @@ fn resp_parse(buf: &Vec<u8>, start: u64) -> ParseResult {
                     return parse_result(PARSE_ERROR, 0);
                 };
                 let arg: Vec<u8> = Vec::new();
-                let arg2 = bytes_push_range(arg, buf, n2, n2 + blen_u);
+                let arg2 = sa_vec_u8_extend_from_vec(arg, buf, n2, blen_u);
                 args.push(arg2);
                 pos = n2 + blen_u + 2;
             };
@@ -200,7 +201,7 @@ fn resp_bulk(out: Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
     out = append_i64(out, len(data) as i64);
     out.push(13);
     out.push(10);
-    out = bytes_push_range(out, data, 0, len(data));
+    out = sa_vec_u8_extend_from_vec(out, data, 0, len(data));
     out.push(13);
     out.push(10);
     return out;
