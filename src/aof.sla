@@ -18,6 +18,7 @@
 @import "sa_std/fs.sai"
 @import "sa_std/status.sla"
 @import "sa_std/vec.sa"
+@import "sa_std/vec_packed.sla"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "sa_std/core/slice.sa"
@@ -231,16 +232,38 @@ fn aof_flush_write(st: &AofState, now_ms: i64) -> bool {
     };
     let chunks = st.pending;
     st.pending = Vec::new();
-    let total: u64 = 0;
-    let ci: u64 = 0;
-    while ci < len(chunks) {
-        if aof_write_all(st.file, &chunks[ci], PTR_BYTE_ADD(&st.wbuf, 0)) != true {
+    // Single-chunk fast path: the common -P 1 case stages one
+    // record per pass, so there is nothing to merge -- writing
+    // it directly avoids one temporary Vec allocation + copy.
+    if len(chunks) == 1 {
+        let only_total: u64 = len(chunks[0]);
+        if aof_write_all(st.file, &chunks[0], PTR_BYTE_ADD(&st.wbuf, 0)) != true {
             st.broken = true;
             return false;
         };
-        total = total + len(chunks[ci]);
+        st.size = st.size + only_total;
+        st.unsynced = st.unsynced + only_total;
+        return true;
+    };
+    // Group-write (knife3): merge the finished record chunks in
+    // order and hand them to aof_write_all once instead of one
+    // write pass per record. The bytes and their order on disk
+    // are unchanged; only the syscall count drops. Merging
+    // complete chunks through the std bulk-copy face is linear
+    // in total bytes -- the quadratic trap this module avoids is
+    // in BUILDING records with the value-threaded resp writers,
+    // not in concatenating already-built chunks.
+    let merged: Vec<u8> = Vec::new();
+    let ci: u64 = 0;
+    while ci < len(chunks) {
+        merged = sa_vec_u8_extend_from_vec(merged, &chunks[ci], 0, len(chunks[ci]));
         ci = ci + 1;
     }
+    let total: u64 = len(merged);
+    if aof_write_all(st.file, &merged, PTR_BYTE_ADD(&st.wbuf, 0)) != true {
+        st.broken = true;
+        return false;
+    };
     st.size = st.size + total;
     st.unsynced = st.unsynced + total;
     return true;
