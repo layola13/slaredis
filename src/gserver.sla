@@ -213,9 +213,27 @@ struct SrvCtx {
     // command executions.
     op_pool: Vec<*AofOp>,
     op_mu: u64,
+    // In-flight set (fix D): op_live[i] is true while the op
+    // block with idx i is out of the pool. Takes set it, gives
+    // clear it; a give of an op already back in the pool is
+    // skipped (no duplicate pool entry). The flag and pool
+    // membership move together under op_mu, so the pool can
+    // never hold an op that is already live; together with
+    // fix A this makes double-ownership impossible at the
+    // pool, whatever else misorders.
+    op_live: [bool; 256],
+    // Per-use generation counter (fix B), bumped at every
+    // pool take under op_mu.
+    op_gen: u64,
     cmd_chan: Chan<*CmdReq>,
     aof_chan: Chan<*AofOp>,
     aof_recycle: Chan<*AofOp>,
+    // Fix C3: parallel result channel for recycle completions.
+    // Carries (op_idx<<1)|result_bit, one token per recycle,
+    // sent BEFORE the op pointer so it is already queued when
+    // the executor receives the pointer. Plain u64, no pointer
+    // inside any message (C2's tuple channel corrupted the heap).
+    aof_recycle_res: Chan<u64>,
     sup_reg: Chan<(u64, u64)>,
     // Connection goroutines hand reply bytes and close
     // requests to the IO driver on this channel, then poke the
@@ -295,6 +313,12 @@ struct AofOp {
     done: Chan<u64>,
     wait: bool,
     via_recycle: bool,
+    // Per-use generation (fix B): stamped at pool take from
+    // the SrvCtx counter; a waiter records the generation it
+    // dispatched and refuses a completion whose generation has
+    // moved, so a retaken op can never hand a stale result to
+    // the earlier waiter.
+    gen: u64,
 }
 
 // IO driver -> connection goroutine: one read chunk (up to
@@ -368,6 +392,9 @@ struct ConnJob {
     // mid-pass. Empty under every other fsync mode (those
     // ops are fire-and-forget; the writer returns them).
     inl_ops: Vec<*AofOp>,
+    // Per-use generations (fix B) parallel to inl_ops: the
+    // generation each op had when dispatched this pass.
+    inl_gens: Vec<u64>,
     // Latched when one of this connection's own append ops
     // reports failure. The writer also raises the ctx-wide
     // sticky flag (aof_broken); this per-connection latch is
@@ -508,6 +535,13 @@ struct ExecSt {
     // order it processes, so completions arrive head-first.
     pend_reqs: Vec<*CmdReq>,
     pend_ops: Vec<*AofOp>,
+    // Fix A': the generation each pend op had when dispatched,
+    // parallel to pend_ops. A recycle matches a pend entry only
+    // when both idx and generation agree; idx alone is the pool
+    // slot, not the use, so a stale recycle from a previous use
+    // of the same slot would otherwise match the current entry
+    // and read its result before the writer sets it.
+    pend_gens: Vec<u64>,
 }
 
 fn g_signal(req: *CmdReq) {
@@ -568,7 +602,17 @@ fn g_pool_unlock(ctx: *SrvCtx) {
 
 fn g_pool_give(ctx: *SrvCtx, op: *AofOp) {
     g_pool_lock(ctx);
-    (*ctx).op_pool.push(op);
+    // Fix D: the op is live (out of the pool) iff its flag is
+    // set. A give of an already-returned op would plant a
+    // duplicate pool entry -- skip the push; the op is already
+    // available for taking. (With fix A this should not
+    // happen; the flag makes the pool robust anyway.)
+    let lv: [bool; 256] = (*ctx).op_live;
+    if lv[(*op).idx] {
+        lv[(*op).idx] = false;
+        (*ctx).op_live = lv;
+        (*ctx).op_pool.push(op);
+    };
     g_pool_unlock(ctx);
 }
 
@@ -589,6 +633,30 @@ fn g_pool_take(ctx: *SrvCtx) -> *AofOp {
     }
     let n: u64 = len((*ctx).op_pool);
     let op = (*ctx).op_pool[n - 1];
+    // Fix D: mark live (the op leaves the pool); fix B: stamp
+    // this use's generation. Both move under op_mu with the
+    // removal, so the flag and pool membership stay in step.
+    let lv: [bool; 256] = (*ctx).op_live;
+    lv[(*op).idx] = true;
+    (*ctx).op_live = lv;
+    (*ctx).op_gen = (*ctx).op_gen + 1;
+    (*op).gen = (*ctx).op_gen;
+    // Fix B': drain a stale done token, if any, left in this
+    // op's channel by a previous use. The done channel is
+    // per-op and persists across uses (capacity 1); a token
+    // left behind lets the next use's waiter consume it at
+    // once and read this use's result before the writer sets
+    // it (still false from dispatch) -- the observed inline
+    // result=0 latch with a matching generation, which no
+    // generation check can catch. A fresh use must start
+    // with an empty done channel.
+    select {
+        case let sd = (*op).done.recv() {
+            let sd_use: u64 = sd;
+        }
+        default {
+        }
+    }
     // Vec has no pop in this stack: rebuild without the tail.
     let nf: Vec<*AofOp> = Vec::new();
     let i: u64 = 0;
@@ -607,12 +675,34 @@ fn g_pool_take(ctx: *SrvCtx) -> *AofOp {
 // fsync=always, synced -- i.e. the durability point is the
 // writer's sync, exactly where it was when the executor's
 // pending FIFO was the only waiter.
-fn g_op_complete(ctx: *SrvCtx, op: *AofOp) {
+// Fix C2+C3: the completion outcome travels as an explicit argument
+// (and, for the recycle path, in a parallel u64 message), never via
+// the shared (*op).result field -- a completer/waiter can observe
+// that field stale. The writer passes the outcome it computed
+// locally (group write/sync result, or swap result).
+fn g_op_complete(ctx: *SrvCtx, op: *AofOp, ok: bool) {
     if (*op).via_recycle {
+        // Fix C3: send the result token FIRST (so it is already
+        // queued when the executor receives the pointer), then
+        // the op pointer. Token: (op_idx<<1)|result_bit.
+        let rtok: u64 = (*op).idx << 1;
+        if ok {
+            rtok = rtok | 1;
+        };
+        (*ctx).aof_recycle_res.send(rtok);
         (*ctx).aof_recycle.send(op);
     } else {
         if (*op).wait {
-            (*op).done.send(1);
+            // Fix B''+C+C3: the done token carries this use's
+            // generation in the high bits and the completion
+            // result in bit 0 (from the ok argument, not the
+            // shared field), so a waiter learns both from
+            // the channel (which delivers the value).
+            let tok: u64 = (*op).gen << 1;
+            if ok {
+                tok = tok | 1;
+            };
+            (*op).done.send(tok);
         } else {
             g_pool_give(ctx, op);
         };
@@ -625,21 +715,56 @@ fn g_op_complete(ctx: *SrvCtx, op: *AofOp) {
 // failure marks the executor broken for subsequent batches,
 // exactly as the synchronous wait result used to. Either way
 // the op returns to the shared pool.
-fn g_recycle_handle(st: *ExecSt, op: *AofOp) {
-    if len((*st).pend_ops) > 0 {
-        if (*(*st).pend_ops[0]).idx == (*op).idx {
-            let req = (*st).pend_reqs[0];
-            let ok = (*op).result;
+// Fix C3: ok arrives via the parallel result channel (see
+// g_op_complete); the executor never reads the shared
+// (*op).result field here.
+fn g_recycle_handle(st: *ExecSt, op: *AofOp, ok: bool) {
+    // Fix A': match by (idx, generation) anywhere in the
+    // pending FIFO, not just the head -- recycle completions
+    // may arrive out of order (step-1 report: op 231
+    // completing before pend head 209), and idx alone is the
+    // pool slot, not the use: a stale recycle from a previous
+    // use of the same slot would match the current entry and
+    // read its result before the writer sets it (still false
+    // from dispatch) -- the observed recycle-match-false
+    // latch. The generation snapshotted into pend_gens at
+    // dispatch identifies the use; a stale recycle (old
+    // generation) matches nothing and is dropped. Releasing
+    // the matched batch is safe out of order: the writer
+    // completes an op only after its group is written and,
+    // under fsync=always, synced, so a batch's done signal is
+    // released only after a sync covering its own records has
+    // landed, whatever the order of the other batches. A
+    // completion with no pending entry is stale (its batch was
+    // already released, or its generation was superseded);
+    // the op is NOT returned to the pool here -- returning it
+    // would re-create the double-ownership the old head-only
+    // match produced (the op would be both live as a fresh
+    // take and referenced by a still-pending batch). Failing
+    // closed costs one pool slot per stale completion, and
+    // the count argument (one recycle per deferred dispatch,
+    // one pend entry per dispatch) says it cannot happen in a
+    // clean run; the validation rounds would stall visibly if
+    // it ever did.
+    let i: u64 = 0;
+    while i < len((*st).pend_ops) {
+        if (*(*st).pend_ops[i]).idx == (*op).idx && (*st).pend_gens[i] == (*op).gen {
+            let req = (*st).pend_reqs[i];
             let nr: Vec<*CmdReq> = Vec::new();
             let no: Vec<*AofOp> = Vec::new();
-            let i: u64 = 1;
-            while i < len((*st).pend_reqs) {
-                nr.push((*st).pend_reqs[i]);
-                no.push((*st).pend_ops[i]);
-                i = i + 1;
+            let ng: Vec<u64> = Vec::new();
+            let j: u64 = 0;
+            while j < len((*st).pend_ops) {
+                if j != i {
+                    nr.push((*st).pend_reqs[j]);
+                    no.push((*st).pend_ops[j]);
+                    ng.push((*st).pend_gens[j]);
+                };
+                j = j + 1;
             }
             (*st).pend_reqs = nr;
             (*st).pend_ops = no;
+            (*st).pend_gens = ng;
             if ok != true {
                 (*st).broken = true;
             };
@@ -647,8 +772,8 @@ fn g_recycle_handle(st: *ExecSt, op: *AofOp) {
             g_signal(req);
             return;
         };
-    };
-    g_pool_give((*st).ctx, op);
+        i = i + 1;
+    }
 }
 
 fn g_op_drain(st: *ExecSt) {
@@ -656,7 +781,33 @@ fn g_op_drain(st: *ExecSt) {
     while draining {
         select {
             case let op = (*(*st).ctx).aof_recycle.recv() {
-                g_recycle_handle(st, op);
+                // Fix C3b: the paired result token was sent
+                // before this pointer, so it is normally
+                // already queued. Receive it with a
+                // NON-BLOCKING spin (select+default+yield):
+                // a blocking recv nested inside a select
+                // case segfaulted the server (C3).
+                let tok_got: bool = false;
+                let rok: bool = false;
+                let spin: u64 = 0;
+                while tok_got != true {
+                    select {
+                        case let tv = (*(*st).ctx).aof_recycle_res.recv() {
+                            rok = (tv & 1) == 1;
+                            tok_got = true;
+                        }
+                        default {
+                            spin = spin + 1;
+                            if spin > 10000 {
+                                rok = (*op).result;
+                                tok_got = true;
+                            } else {
+                                let yst: i32 = sa_task_yield();
+                            };
+                        }
+                    }
+                }
+                g_recycle_handle(st, op, rok);
             }
             default {
                 draining = false;
@@ -688,6 +839,30 @@ fn g_op_take(st: *ExecSt) -> *AofOp {
     }
     let n: u64 = len((*ctx).op_pool);
     let op = (*ctx).op_pool[n - 1];
+    // Fix D: mark live (the op leaves the pool); fix B: stamp
+    // this use's generation. Both move under op_mu with the
+    // removal, so the flag and pool membership stay in step.
+    let lv: [bool; 256] = (*ctx).op_live;
+    lv[(*op).idx] = true;
+    (*ctx).op_live = lv;
+    (*ctx).op_gen = (*ctx).op_gen + 1;
+    (*op).gen = (*ctx).op_gen;
+    // Fix B': drain a stale done token, if any, left in this
+    // op's channel by a previous use. The done channel is
+    // per-op and persists across uses (capacity 1); a token
+    // left behind lets the next use's waiter consume it at
+    // once and read this use's result before the writer sets
+    // it (still false from dispatch) -- the observed inline
+    // result=0 latch with a matching generation, which no
+    // generation check can catch. A fresh use must start
+    // with an empty done channel.
+    select {
+        case let sd = (*op).done.recv() {
+            let sd_use: u64 = sd;
+        }
+        default {
+        }
+    }
     // Vec has no pop in this stack: rebuild without the tail.
     let nf: Vec<*AofOp> = Vec::new();
     let i: u64 = 0;
@@ -710,18 +885,54 @@ fn g_op_take(st: *ExecSt) -> *AofOp {
 // here. (Connection waiters need no pump: they are leaves --
 // nothing the writer or executor waits for depends on a
 // connection finishing its wait.)
-fn g_op_wait_done(st: *ExecSt, mine: *AofOp) -> bool {
+fn g_op_wait_done(st: *ExecSt, mine: *AofOp, gen: u64) -> bool {
     let ctx = (*st).ctx;
     let waiting: bool = true;
     let res: bool = false;
     while waiting {
         select {
             case let dv = (*mine).done.recv() {
-                res = (*mine).result;
-                waiting = false;
+                // Fix B''+C: accept only this use's token
+                // (high bits = generation); the result is bit
+                // 0 of the token, read from the channel, not
+                // from the shared result field (see g_op_complete).
+                if (dv >> 1) == gen {
+                    res = (dv & 1) == 1;
+                    // Fix B: the completion belongs to this use
+                    // only if the generation still matches the one
+                    // recorded at dispatch; a moved generation
+                    // means the op was retaken meanwhile, so the
+                    // result field no longer belongs to this use.
+                    if (*mine).gen != gen {
+                        res = false;
+                    };
+                    waiting = false;
+                };
             }
             case let rop = (*ctx).aof_recycle.recv() {
-                g_recycle_handle(st, rop);
+                // Fix C3b: paired result token, non-blocking
+                // spin (see g_op_drain).
+                let tok_got: bool = false;
+                let rok: bool = false;
+                let spin: u64 = 0;
+                while tok_got != true {
+                    select {
+                        case let tv = (*ctx).aof_recycle_res.recv() {
+                            rok = (tv & 1) == 1;
+                            tok_got = true;
+                        }
+                        default {
+                            spin = spin + 1;
+                            if spin > 10000 {
+                                rok = (*rop).result;
+                                tok_got = true;
+                            } else {
+                                let yst: i32 = sa_task_yield();
+                            };
+                        }
+                    }
+                }
+                g_recycle_handle(st, rop, rok);
             }
             default {
                 let yst: i32 = sa_task_yield();
@@ -741,6 +952,7 @@ fn g_op_wait_done(st: *ExecSt, mine: *AofOp) -> bool {
 fn g_aof_append(st: *ExecSt, chunks: Vec<Vec<u8>>) -> bool {
     let ctx = (*st).ctx;
     let op = g_op_take(st);
+    let mygen = (*op).gen;
     (*op).kind = AOF_OP_APPEND;
     (*op).chunks = chunks;
     (*op).data = Vec::new();
@@ -749,7 +961,7 @@ fn g_aof_append(st: *ExecSt, chunks: Vec<Vec<u8>>) -> bool {
     if (*ctx).aof_fsync == AOF_FSYNC_ALWAYS {
         (*op).wait = true;
         (*ctx).aof_chan.send(op);
-        let ok = g_op_wait_done(st, op);
+        let ok = g_op_wait_done(st, op, mygen);
         if ok != true {
             (*st).broken = true;
         };
@@ -781,6 +993,7 @@ fn g_aof_append_defer(st: *ExecSt, chunks: Vec<Vec<u8>>, req: *CmdReq) {
     (*ctx).aof_chan.send(op);
     (*st).pend_reqs.push(req);
     (*st).pend_ops.push(op);
+    (*st).pend_gens.push((*op).gen);
 }
 
 // Dispatch one install op carrying a serialized dataset. The
@@ -790,6 +1003,7 @@ fn g_aof_append_defer(st: *ExecSt, chunks: Vec<Vec<u8>>, req: *CmdReq) {
 fn g_aof_install(st: *ExecSt, data: Vec<u8>, wait: bool) -> bool {
     let ctx = (*st).ctx;
     let op = g_op_take(st);
+    let mygen = (*op).gen;
     (*op).kind = AOF_OP_INSTALL;
     (*op).chunks = Vec::new();
     (*op).data = data;
@@ -798,7 +1012,7 @@ fn g_aof_install(st: *ExecSt, data: Vec<u8>, wait: bool) -> bool {
     (*op).wait = wait;
     (*ctx).aof_chan.send(op);
     if wait {
-        return g_op_wait_done(st, op);
+        return g_op_wait_done(st, op, mygen);
     };
     return true;
 }
@@ -939,6 +1153,7 @@ fn g_try_inline_write(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
     // an unused op (try-lock miss, errored command) is simply
     // handed back. Only the send below happens in-lock.
     let op = g_pool_take(ctx);
+    let mygen = (*op).gen;
     if g_try_lock_store(ctx) != true {
         g_pool_give(ctx, op);
         return false;
@@ -988,6 +1203,7 @@ fn g_try_inline_write(job: *ConnJob, args: &Vec<Vec<u8>>) -> bool {
     };
     if (*ctx).aof_fsync == AOF_FSYNC_ALWAYS {
         (*job).inl_ops.push(op);
+        (*job).inl_gens.push(mygen);
         if len((*job).inl_ops) >= INL_WAIT_CAP {
             g_inline_wait(job);
         };
@@ -1036,14 +1252,34 @@ fn g_inline_wait(job: *ConnJob) {
     let i: u64 = 0;
     while i < len((*job).inl_ops) {
         let op = (*job).inl_ops[i];
-        let (dv, dcl) = (*op).done.recv();
-        if (*op).result != true {
+        // Fix B'': wait for this use's token. A stale token
+        // (previous use's generation, left in the per-op
+        // channel) is discarded and the wait continues; only
+        // this use's token releases the wait, so the result
+        // read below is this use's.
+        let got: bool = false;
+        let tok_res: bool = false;
+        while got != true {
+            let (dv, dcl) = (*op).done.recv();
+            // Fix C: the token's high bits are this use's
+            // generation, bit 0 is the completion result.
+            // Accept only this use's token; the result comes
+            // from the token, never from the shared field.
+            if (dv >> 1) == (*job).inl_gens[i] {
+                tok_res = (dv & 1) == 1;
+                got = true;
+            };
+        }
+        // Fix B: refuse a completion whose generation moved
+        // since dispatch (the op was retaken meanwhile).
+        if tok_res != true || (*op).gen != (*job).inl_gens[i] {
             (*job).aof_dead = true;
         };
         g_pool_give(ctx, op);
         i = i + 1;
     }
     (*job).inl_ops = Vec::new();
+    (*job).inl_gens = Vec::new();
 }
 
 // ---- connection goroutine ----
@@ -1361,7 +1597,7 @@ fn g_exec_batch(st: *ExecSt, req: *CmdReq) -> bool {
 
 fn g_exec_main(job: *ExecJob) {
     let ctx = (*job).ctx;
-    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new(), pend_reqs: Vec::new(), pend_ops: Vec::new() }));
+    let st = Box::into_raw(Box::new(ExecSt { ctx: ctx, broken: false, since_yield: 0, cur_batch: Vec::new(), cur_chunks: Vec::new(), pend_reqs: Vec::new(), pend_ops: Vec::new(), pend_gens: Vec::new() }));
     // The op pool lives in SrvCtx (created in
     // run_server_goroutine before any goroutine spawns): it
     // is shared with the connection goroutines since step 3.
@@ -1423,8 +1659,30 @@ fn g_exec_step(st: *ExecSt) {
                 case let req = (*ctx).cmd_chan.recv() {
                     g_exec_handle(st, req);
                 }
-                case let op = (*ctx).aof_recycle.recv() {
-                    g_recycle_handle(st, op);
+                case let rop = (*ctx).aof_recycle.recv() {
+                    // Fix C3b: paired result token, non-blocking
+                    // spin (see g_op_drain).
+                    let tok_got: bool = false;
+                    let rok: bool = false;
+                    let spin: u64 = 0;
+                    while tok_got != true {
+                        select {
+                            case let tv = (*ctx).aof_recycle_res.recv() {
+                                rok = (tv & 1) == 1;
+                                tok_got = true;
+                            }
+                            default {
+                                spin = spin + 1;
+                                if spin > 10000 {
+                                    rok = (*rop).result;
+                                    tok_got = true;
+                                } else {
+                                    let yst: i32 = sa_task_yield();
+                                };
+                            }
+                        }
+                    }
+                    g_recycle_handle(st, rop, rok);
                 }
             }
         };
@@ -1459,16 +1717,20 @@ fn g_aof_step(job: *AofJob) {
         select {
             case let op = (*ctx).aof_chan.recv() {
                 if (*op).kind == AOF_OP_INSTALL {
+                    // Fix C2+C3: capture the swap outcome in a
+                    // local and pass it explicitly.
+                    let iok: bool = false;
                     if (*job).wst.broken {
                         (*op).result = false;
                     } else {
-                        (*op).result = aof_swap_in(&(*job).wst, &(*op).data, sa_time_unix_ms());
+                        iok = aof_swap_in(&(*job).wst, &(*op).data, sa_time_unix_ms());
+                        (*op).result = iok;
                     };
                     (*job).rw_out = false;
                     if (*job).wst.broken {
                         (*ctx).aof_broken = true;
                     };
-                    g_op_complete(ctx, op);
+                    g_op_complete(ctx, op, iok);
                 } else {
                     let group: Vec<*AofOp> = Vec::new();
                     group.push(op);
@@ -1569,11 +1831,18 @@ fn g_aof_step(job: *AofJob) {
                     // set above, before any completion is
                     // signalled, so no waiter can observe a
                     // half-completed group.
+                    // Fix C2+C3: the group outcome, computed
+                    // here from the writer's own locals
+                    // (write_failed is final at this point),
+                    // is passed to g_op_complete explicitly --
+                    // no completion decision reads the shared
+                    // result field.
+                    let gok: bool = write_failed != true;
                     let ri: u64 = 0;
                     while ri < len(group) {
                         let rop = group[ri];
                         if (*rop).via_recycle != true {
-                            g_op_complete(ctx, rop);
+                            g_op_complete(ctx, rop, gok);
                         };
                         ri = ri + 1;
                     }
@@ -1581,21 +1850,25 @@ fn g_aof_step(job: *AofJob) {
                     while rj < len(group) {
                         let rop2 = group[rj];
                         if (*rop2).via_recycle {
-                            g_op_complete(ctx, rop2);
+                            g_op_complete(ctx, rop2, gok);
                         };
                         rj = rj + 1;
                     }
                     if has_install {
+                        // Fix C2+C3: capture the swap outcome
+                        // in a local and pass it explicitly.
+                        let rok: bool = false;
                         if (*job).wst.broken {
                             (*install_op).result = false;
                         } else {
-                            (*install_op).result = aof_swap_in(&(*job).wst, &(*install_op).data, sa_time_unix_ms());
+                            rok = aof_swap_in(&(*job).wst, &(*install_op).data, sa_time_unix_ms());
+                            (*install_op).result = rok;
                         };
                         (*job).rw_out = false;
                         if (*job).wst.broken {
                             (*ctx).aof_broken = true;
                         };
-                        g_op_complete(ctx, install_op);
+                        g_op_complete(ctx, install_op, rok);
                     };
                 };
             }
@@ -1955,7 +2228,7 @@ fn g_io_accept(st: *IoSt) {
             };
             let dchan: Chan<u64> = Chan::new(0);
             let req = Box::into_raw(Box::new(CmdReq { kind: CMD_BATCH, ack: true, batch: Vec::new(), replies: Vec::new(), done: dchan }));
-            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outsegs: Vec::new(), inl_args: Vec::new(), inl_ops: Vec::new(), aof_dead: false, authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
+            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outsegs: Vec::new(), inl_args: Vec::new(), inl_ops: Vec::new(), inl_gens: Vec::new(), aof_dead: false, authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
             let gh = go g_conn_main(cj);
             (*ctx).sup_reg.send((gh, h));
             accepts = accepts + 1;
@@ -2227,6 +2500,7 @@ fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig
     let cmd_chan: Chan<*CmdReq> = Chan::new(256);
     let aof_chan: Chan<*AofOp> = Chan::new(64);
     let aof_recycle: Chan<*AofOp> = Chan::new(64);
+    let aof_recycle_res: Chan<u64> = Chan::new(64);
     let sup_reg: Chan<(u64, u64)> = Chan::new(256);
     let io_out: Chan<*IoOut> = Chan::new(256);
     let authp = Box::into_raw(Box::new(auth));
@@ -2254,7 +2528,7 @@ fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig
     let pi: u64 = 0;
     while pi < 256 {
         let dch: Chan<u64> = Chan::new(1);
-        let opx = Box::into_raw(Box::new(AofOp { kind: AOF_OP_APPEND, idx: pi, chunks: Vec::new(), data: Vec::new(), result: false, done: dch, wait: false, via_recycle: false }));
+        let opx = Box::into_raw(Box::new(AofOp { kind: AOF_OP_APPEND, idx: pi, chunks: Vec::new(), data: Vec::new(), result: false, done: dch, wait: false, via_recycle: false, gen: 0 }));
         op_pool.push(opx);
         pi = pi + 1;
     }
@@ -2266,9 +2540,12 @@ fn run_server_goroutine(store: Store, host: Vec<u8>, port: u32, auth: AuthConfig
         store_mu: store_mu,
         op_pool: op_pool,
         op_mu: op_mu,
+        op_live: [false; 256],
+        op_gen: 0,
         cmd_chan: cmd_chan,
         aof_chan: aof_chan,
         aof_recycle: aof_recycle,
+        aof_recycle_res: aof_recycle_res,
         sup_reg: sup_reg,
         io_out: io_out,
         wake_tx: wake_tx,
