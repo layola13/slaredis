@@ -616,6 +616,38 @@ fn g_pool_give(ctx: *SrvCtx, op: *AofOp) {
     g_pool_unlock(ctx);
 }
 
+// Claim an op for the writer: remove any duplicate pool entry
+// for it, so it cannot be re-taken while the writer holds it.
+// DEF-VEC-PUSH-UAF (task 162): a duplicate pool entry (or a
+// duplicate send) lets another dispatcher re-take and rebuild
+// an op (setting (*op).chunks = <new>, freeing the old chunks
+// buffer and chunk data buffers) while this writer is copying
+// from it in bytes_push_range, so the copy reads a stale pointer
+// and segfaults (observed: ip 0x10cc39d, caller 0x10dee57).
+// The writer claims each op the moment it receives it from
+// aof_chan, before copying its chunks: under op_mu, every pool
+// entry for this op is removed and the op is marked live, so no
+// dispatcher can take it until the writer completes it and
+// returns it via g_pool_give / g_op_complete. Idempotent: when
+// there is no duplicate entry (the normal case) this only
+// re-asserts the live flag and rebuilds the pool unchanged.
+fn g_pool_claim(ctx: *SrvCtx, op: *AofOp) {
+    g_pool_lock(ctx);
+    let nf: Vec<*AofOp> = Vec::new();
+    let i: u64 = 0;
+    while i < len((*ctx).op_pool) {
+        if (*(*ctx).op_pool[i]).idx != (*op).idx {
+            nf.push((*ctx).op_pool[i]);
+        };
+        i = i + 1;
+    }
+    (*ctx).op_pool = nf;
+    let lv: [bool; 256] = (*ctx).op_live;
+    lv[(*op).idx] = true;
+    (*ctx).op_live = lv;
+    g_pool_unlock(ctx);
+}
+
 // Take one op, spinning (yield, never park) while the pool is
 // empty. The spin terminates because every op holder makes
 // progress without the spinner: the writer returns
@@ -1716,6 +1748,11 @@ fn g_aof_step(job: *AofJob) {
         let ctx = (*job).ctx;
         select {
             case let op = (*ctx).aof_chan.recv() {
+                // DEF-VEC-PUSH-UAF (task 162): claim the op so a
+                // duplicate pool entry cannot let another dispatcher
+                // re-take and rebuild it while this writer copies
+                // its chunks.
+                g_pool_claim(ctx, op);
                 if (*op).kind == AOF_OP_INSTALL {
                     // Fix C2+C3: capture the swap outcome in a
                     // local and pass it explicitly.
@@ -1753,6 +1790,7 @@ fn g_aof_step(job: *AofJob) {
                         } else {
                             select {
                                 case let op2 = (*ctx).aof_chan.recv() {
+                                    g_pool_claim(ctx, op2);
                                     if (*op2).kind == AOF_OP_INSTALL {
                                         install_op = op2;
                                         has_install = true;
@@ -1770,13 +1808,23 @@ fn g_aof_step(job: *AofJob) {
                     let ci2: u64 = 0;
                     while ci2 < len(group) {
                         let cop = group[ci2];
+                        // DEF-VEC-PUSH-UAF (task 162): move the op's
+                        // chunks out into writer-local ownership
+                        // BEFORE copying them, so a concurrent rebuild
+                        // cannot free the data under the copy. The
+                        // claim (g_pool_claim, at recv) removes a
+                        // duplicate pool entry; the move-out makes
+                        // the copy itself read only writer-owned
+                        // memory. Together they close the stale-pointer
+                        // read in bytes_push_range (ip 0x10cc39d).
+                        let mychunks = (*cop).chunks;
+                        (*cop).chunks = Vec::new();
                         let chi: u64 = 0;
-                        while chi < len((*cop).chunks) {
+                        while chi < len(mychunks) {
                             let gb = (*job).gbuf;
-                            (*job).gbuf = bytes_push_range(gb, &(*cop).chunks[chi], 0, len((*cop).chunks[chi]));
+                            (*job).gbuf = bytes_push_range(gb, &mychunks[chi], 0, len(mychunks[chi]));
                             chi = chi + 1;
                         }
-                        (*cop).chunks = Vec::new();
                         ci2 = ci2 + 1;
                     }
                     if (*job).wst.broken {
