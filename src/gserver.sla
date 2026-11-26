@@ -721,8 +721,20 @@ fn g_op_complete(ctx: *SrvCtx, op: *AofOp, ok: bool) {
     if (*op).via_recycle {
         // Fix C3: send the result token FIRST (so it is already
         // queued when the executor receives the pointer), then
-        // the op pointer. Token: (op_idx<<1)|result_bit.
-        let rtok: u64 = (*op).idx << 1;
+        // the op pointer. Task 168 (carry_gen): the token
+        // carries this use's GENERATION in the high bits, not
+        // the pool slot idx -- the completion channel carries
+        // only the op pointer, so the token is the
+        // generation's ride. A stale completion (previous
+        // generation, same slot) must not match the current
+        // pending entry (see g_recycle_handle). Token:
+        // (op_recv_gen<<1)|result_bit.
+        // recv_gen is the generation recorded at RECEIVE
+        // time (g_aof_step), before any re-take; the live
+        // gen is vacuous here -- the slot may already hold
+        // gen N+1 via an earlier stale completion -- so it
+        // must NOT be used for the token.
+        let rtok: u64 = (*op).recv_gen << 1;
         if ok {
             rtok = rtok | 1;
         };
@@ -755,7 +767,13 @@ fn g_op_complete(ctx: *SrvCtx, op: *AofOp, ok: bool) {
 // Fix C3: ok arrives via the parallel result channel (see
 // g_op_complete); the executor never reads the shared
 // (*op).result field here.
-fn g_recycle_handle(st: *ExecSt, op: *AofOp, ok: bool) {
+fn g_recycle_handle(st: *ExecSt, op: *AofOp, ok: bool, cgen: u64) {
+    // Task 168 (carry_gen): cgen is the generation carried by
+    // the completion (the token on aof_recycle_res, high bits),
+    // i.e. the generation of the op the writer actually
+    // completed -- NOT the op's live gen, which already holds
+    // the current generation and would match any stale
+    // completion for the same slot.
     // Fix A': match by (idx, generation) anywhere in the
     // pending FIFO, not just the head -- recycle completions
     // may arrive out of order (step-1 report: op 231
@@ -785,7 +803,7 @@ fn g_recycle_handle(st: *ExecSt, op: *AofOp, ok: bool) {
     // it ever did.
     let i: u64 = 0;
     while i < len((*st).pend_ops) {
-        if (*(*st).pend_ops[i]).idx == (*op).idx && (*st).pend_gens[i] == (*op).gen {
+        if (*(*st).pend_ops[i]).idx == (*op).idx && (*st).pend_gens[i] == cgen {
             let req = (*st).pend_reqs[i];
             let nr: Vec<*CmdReq> = Vec::new();
             let no: Vec<*AofOp> = Vec::new();
@@ -826,17 +844,26 @@ fn g_op_drain(st: *ExecSt) {
                 // case segfaulted the server (C3).
                 let tok_got: bool = false;
                 let rok: bool = false;
+                // Task 168 (carry_gen): the generation carried
+                // by this completion (token high bits).
+                let cgen: u64 = 0;
                 let spin: u64 = 0;
                 while tok_got != true {
                     select {
                         case let tv = (*(*st).ctx).aof_recycle_res.recv() {
                             rok = (tv & 1) == 1;
+                            cgen = tv >> 1;
                             tok_got = true;
                         }
                         default {
                             spin = spin + 1;
                             if spin > 10000 {
                                 rok = (*op).result;
+                                // No token arrived: fall back to
+                                // the live gen (the old behaviour;
+                                // the token is sent before the
+                                // pointer, so this should not fire).
+                                cgen = (*op).gen;
                                 tok_got = true;
                             } else {
                                 let yst: i32 = sa_task_yield();
@@ -844,7 +871,7 @@ fn g_op_drain(st: *ExecSt) {
                         }
                     }
                 }
-                g_recycle_handle(st, op, rok);
+                g_recycle_handle(st, op, rok, cgen);
             }
             default {
                 draining = false;
@@ -951,17 +978,26 @@ fn g_op_wait_done(st: *ExecSt, mine: *AofOp, gen: u64) -> bool {
                 // spin (see g_op_drain).
                 let tok_got: bool = false;
                 let rok: bool = false;
+                // Task 168 (carry_gen): the generation carried
+                // by this completion (token high bits).
+                let cgen: u64 = 0;
                 let spin: u64 = 0;
                 while tok_got != true {
                     select {
                         case let tv = (*ctx).aof_recycle_res.recv() {
                             rok = (tv & 1) == 1;
+                            cgen = tv >> 1;
                             tok_got = true;
                         }
                         default {
                             spin = spin + 1;
                             if spin > 10000 {
                                 rok = (*rop).result;
+                                // No token arrived: fall back to
+                                // the live gen (the old behaviour;
+                                // the token is sent before the
+                                // pointer, so this should not fire).
+                                cgen = (*rop).gen;
                                 tok_got = true;
                             } else {
                                 let yst: i32 = sa_task_yield();
@@ -969,7 +1005,7 @@ fn g_op_wait_done(st: *ExecSt, mine: *AofOp, gen: u64) -> bool {
                         }
                     }
                 }
-                g_recycle_handle(st, rop, rok);
+                g_recycle_handle(st, rop, rok, cgen);
             }
             default {
                 let yst: i32 = sa_task_yield();
@@ -1701,17 +1737,28 @@ fn g_exec_step(st: *ExecSt) {
                     // spin (see g_op_drain).
                     let tok_got: bool = false;
                     let rok: bool = false;
+                    // Task 168 (carry_gen): the generation
+                    // carried by this completion (token high
+                    // bits).
+                    let cgen: u64 = 0;
                     let spin: u64 = 0;
                     while tok_got != true {
                         select {
                             case let tv = (*ctx).aof_recycle_res.recv() {
                                 rok = (tv & 1) == 1;
+                                cgen = tv >> 1;
                                 tok_got = true;
                             }
                             default {
                                 spin = spin + 1;
                                 if spin > 10000 {
                                     rok = (*rop).result;
+                                    // No token arrived: fall back
+                                    // to the live gen (the old
+                                    // behaviour; the token is sent
+                                    // before the pointer, so this
+                                    // should not fire).
+                                    cgen = (*rop).gen;
                                     tok_got = true;
                                 } else {
                                     let yst: i32 = sa_task_yield();
@@ -1719,7 +1766,7 @@ fn g_exec_step(st: *ExecSt) {
                             }
                         }
                     }
-                    g_recycle_handle(st, rop, rok);
+                    g_recycle_handle(st, rop, rok, cgen);
                 }
             }
         };
