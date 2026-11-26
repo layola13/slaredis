@@ -70,12 +70,6 @@ struct AofState {
     // passes; aof_rewrite flushes it before serializing so no
     // staged record can land after the rename.
     pending: Vec<Vec<u8>>,
-    // Write staging for aof_write_all (knife1, 2026-11-02):
-    // aof_write_all used to declare a per-call [u8; 4096] stack
-    // local per chunk and paid the full-size refill (~16 us)
-    // on every chunk of every flush. As a state field it is
-    // filled once; only the staged chunk's bytes are touched.
-    wbuf: [u8; 4096],
 }
 
 fn aof_state_new(cfg: &AofConfig) -> AofState {
@@ -90,7 +84,6 @@ fn aof_state_new(cfg: &AofConfig) -> AofState {
         unsynced: 0,
         broken: false,
         pending: Vec::new(),
-        wbuf: [0u8; 4096],
     };
 }
 
@@ -119,28 +112,22 @@ fn aof_open_append(path: &Vec<u8>) -> (bool, u64) {
     return (true, h);
 }
 
-// Write all of `data` to an open file handle, in 4 KiB staged
-// chunks (partial writes advance and retry). The staging buffer
-// is the caller's persistent AofState.wbuf, passed as a raw
-// pointer (see the field note for the per-call refill tax this
-// replaces); staging writes go through the pointer for the same
-// reason as conn_flush (knife1 probe_t3).
-fn aof_write_all(file: u64, data: &Vec<u8>, stage: ptr) -> bool {
+// Write all of `data` to an open file handle (task 134 AOF
+// round, fix 4): the Vec's own bytes are written directly
+// (VEC_AS_PTR + sa_std_fs_file_write), no 4 KiB staging copy.
+// The slot image is the packed image under VECFIX, the same
+// assumption the memcpy face (sa_vec_u8_extend_from_vec) already
+// relies on. Partial writes advance and retry; a zero write is
+// a failure, as before.
+fn aof_write_all(file: u64, data: &Vec<u8>) -> bool {
+    let base: ptr = VEC_AS_PTR(data);
+    let total: u64 = len(data);
     let off: u64 = 0;
-    while off < len(data) {
-        let chunk: u64 = len(data) - off;
-        if chunk > 4096 {
-            chunk = 4096;
-        };
-        let j: u64 = 0;
-        while j < chunk {
-            let dp: ptr = PTR_NULL();
-            PTR_BYTE_ADD(dp, stage, j);
-            PTR_WRITE_U8(dp, data[off + j]);
-            j = j + 1;
-        }
+    while off < total {
+        let dp: ptr = PTR_BYTE_ADD(base, off);
+        let chunk: u64 = total - off;
         let written: u64 = 0;
-        let st: i32 = sa_std_fs_file_write(file, stage, chunk, &written);
+        let st: i32 = sa_std_fs_file_write(file, dp, chunk, &written);
         if st != SA_STD_OK {
             return false;
         };
@@ -237,7 +224,7 @@ fn aof_flush_write(st: &AofState, now_ms: i64) -> bool {
     // it directly avoids one temporary Vec allocation + copy.
     if len(chunks) == 1 {
         let only_total: u64 = len(chunks[0]);
-        if aof_write_all(st.file, &chunks[0], PTR_BYTE_ADD(&st.wbuf, 0)) != true {
+        if aof_write_all(st.file, &chunks[0]) != true {
             st.broken = true;
             return false;
         };
@@ -260,7 +247,7 @@ fn aof_flush_write(st: &AofState, now_ms: i64) -> bool {
         ci = ci + 1;
     }
     let total: u64 = len(merged);
-    if aof_write_all(st.file, &merged, PTR_BYTE_ADD(&st.wbuf, 0)) != true {
+    if aof_write_all(st.file, &merged) != true {
         st.broken = true;
         return false;
     };
@@ -288,7 +275,7 @@ fn aof_write_group(st: &AofState, data: &Vec<u8>) -> bool {
     if st.broken {
         return false;
     };
-    if aof_write_all(st.file, data, PTR_BYTE_ADD(&st.wbuf, 0)) != true {
+    if aof_write_all(st.file, data) != true {
         st.broken = true;
         return false;
     };
@@ -527,7 +514,7 @@ fn aof_swap_in(st: &AofState, data: &Vec<u8>, now_ms: i64) -> bool {
     if ost != SA_STD_OK {
         return false;
     };
-    if aof_write_all(h, data, PTR_BYTE_ADD(&st.wbuf, 0)) != true {
+    if aof_write_all(h, data) != true {
         let cc = sa_fs_file_close(h);
         let rr = aof_remove_file(&tmp2);
         return false;

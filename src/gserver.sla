@@ -429,10 +429,10 @@ struct AofJob {
     // goroutine is the state's only owner.
     wst: AofState,
     // Step 2 group-write merge buffer: each drained group's
-    // record chunks are appended here (bytes_push_range
-    // accumulation is linear on this toolchain -- probe_gbuf:
-    // 0.11-0.19 us/byte across 26x80 B, 256x80 B and 8x64 KiB
-    // shapes) and written with one aof_write_group call.
+    // record chunks are appended here (sa_vec_u8_extend_from_vec
+    // bulk face, memcpy -- task 134 AOF round, fix 3; the old
+    // bytes_push_range byte loop is 4 ns/B) and written with
+    // one aof_write_group call.
     gbuf: Vec<u8>,
     sreq: *CmdReq,
     rw_out: bool,
@@ -480,11 +480,13 @@ struct DriverConn {
     // was initialization, never content.
     stage: [u8; 8192],
     // The read staging buffer, same one-time-fill reasoning as
-    // `stage` (knife1, 2026-11-02): g_io_read used to declare a
-    // per-call [u8; 4096] stack local and paid the full-size
-    // refill on every read. Bytes are consumed (moved into the
-    // IoMsg Vec) inside g_io_read before it returns.
-    rstage: [u8; 4096],
+    // `rstage` (knife1, 2026-11-02; task 134 AOF round, fix 5):
+    // g_io_read used to declare a per-call [u8; 4096] stack local
+    // and paid the full-size refill on every read. 64 KiB now, so
+    // one read() takes a 256 KiB value in 4 reads, not 64. Bytes
+    // are consumed (moved into the IoMsg Vec) inside g_io_read
+    // before it returns.
+    rstage: [u8; 65536],
     ready: u32,
     read_closed: bool,
     eof_sent: bool,
@@ -1910,7 +1912,7 @@ fn g_aof_step(job: *AofJob) {
                             let chi: u64 = 0;
                             while chi < len(mychunks) {
                                 let gb = (*job).gbuf;
-                                (*job).gbuf = bytes_push_range(gb, &mychunks[chi], 0, len(mychunks[chi]));
+                                (*job).gbuf = sa_vec_u8_extend_from_vec(gb, &mychunks[chi], 0, len(mychunks[chi]));
                                 chi = chi + 1;
                             }
                         };
@@ -2358,7 +2360,7 @@ fn g_io_accept(st: *IoSt) {
             accepts = accepts + 1;
         } else {
             let inbox: Chan<*IoMsg> = Chan::new(16);
-            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], rstage: [0u8; 4096], ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false }));
+            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], rstage: [0u8; 65536], ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false }));
             if (*st).n < 8192 {
                 (*st).slots[(*st).n] = dc;
                 (*st).n = (*st).n + 1;
@@ -2386,12 +2388,12 @@ fn g_io_read(st: *IoSt, dc: *DriverConn) {
         return;
     };
     // Read into the connection's persistent rstage (one-time
-    // fill at construction) and bulk-append through the std
-    // packed-import face; the bytes move into the IoMsg Vec
+    // fill at construction) and bulk-append through the memcpy
+    // face (VEC_EXTEND); the bytes move into the IoMsg Vec
     // before this call returns.
     let bp: ptr = PTR_BYTE_ADD(&(*dc).rstage, 0);
     let nread: u64 = 0;
-    let rst: i32 = sa_std_net_tcp_stream_read((*dc).fd, bp, 4096, &nread);
+    let rst: i32 = sa_std_net_tcp_stream_read((*dc).fd, bp, 65536, &nread);
     if rst != SA_STD_OK {
         // would-block on a nonblocking socket, or a real
         // error; the ERROR readiness bit distinguishes a dead
@@ -2405,8 +2407,11 @@ fn g_io_read(st: *IoSt, dc: *DriverConn) {
         (*dc).read_closed = true;
         return;
     };
-    let fresh: Vec<u8> = Vec::new();
-    let data: Vec<u8> = sa_vec_u8_extend_packed(fresh, bp, nread);
+    // Bulk append (task 134 AOF round, fix 5): VEC_EXTEND is the
+    // memcpy face (one @sa_vec_extend); the old extend_packed is
+    // a byte loop (2.77 ns/B). Same bytes, same Vec.
+    let data: Vec<u8> = Vec::new();
+    VEC_EXTEND(data, bp, nread, 1);
     let m = Box::into_raw(Box::new(IoMsg { bytes: data, eof: false }));
     (*dc).inbox.send(m);
 }
@@ -2495,7 +2500,7 @@ fn g_io_write(st: *IoSt, dc: *DriverConn) {
 fn g_io_run(job: *IoJob) -> i32 {
     let ctx = (*job).ctx;
     let dummy_inbox: Chan<*IoMsg> = Chan::new(1);
-    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], rstage: [0u8; 4096], ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true }));
+    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], rstage: [0u8; 65536], ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true }));
     let st = Box::into_raw(Box::new(IoSt { ctx: ctx, listener: (*job).listener, wake_rx: (*job).wake_rx, slots: [sentinel; 8192], n: 0, lis_ready: 0, wake_ready: 0, any_dead: false }));
     while (*ctx).core_dead != true {
         g_io_drain_out(st);
