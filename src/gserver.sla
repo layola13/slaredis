@@ -1462,11 +1462,8 @@ fn g_conn_step(job: *ConnJob) -> bool {
         let is_eof: bool = (*msg).eof;
         if is_eof != true {
             let mb = (*msg).bytes;
-            let bi2: u64 = 0;
-            while bi2 < len(mb) {
-                (*job).inbuf.push(mb[bi2]);
-                bi2 = bi2 + 1;
-            }
+            // memcpy face (task 134 round 6, probe site #1): bulk extend.
+            (*job).inbuf = sa_vec_u8_extend_from_vec((*job).inbuf, &mb, 0, len(mb));
         };
         // Exec pass over everything buffered (also the final
         // pass on the end-of-stream marker: complete buffered

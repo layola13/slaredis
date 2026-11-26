@@ -5,18 +5,16 @@
 // the SLA String-in-struct shape is a known mislower risk on the
 // SAB/flatten path (sa_std/http_proxy.sla records the same rule).
 @import "sa_std/vec.sa"
+@import "sa_std/vec_packed.sla"
 @import "sa_std/ptr.sa"
 @import "sa_std/string.sa"
 @import "sa_std/fmt.sai"
 @import "sa_std/core/slice.sa"
 
 fn bytes_clone(a: &Vec<u8>) -> Vec<u8> {
+    // memcpy face (task 134 round 6, probe site #3).
     let out: Vec<u8> = Vec::new();
-    let i: u64 = 0;
-    while i < len(a) {
-        out.push(a[i]);
-        i = i + 1;
-    }
+    out = sa_vec_u8_extend_from_vec(out, a, 0, len(a));
     return out;
 }
 
@@ -96,11 +94,10 @@ fn bytes_push_lit(out: Vec<u8>, lit: ptr, lit_len: u64) -> Vec<u8> {
 
 // Append src[from..to] to out. Value-threaded, see bytes_push_lit.
 fn bytes_push_range(out: Vec<u8>, src: &Vec<u8>, from: u64, to: u64) -> Vec<u8> {
-    let i: u64 = from;
-    while i < to {
-        out.push(src[i]);
-        i = i + 1;
-    }
+    // memcpy face (task 134 round 6, probe site #5).
+    if to > from {
+        out = sa_vec_u8_extend_from_vec(out, src, from, to - from);
+    };
     return out;
 }
 
