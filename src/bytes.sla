@@ -123,6 +123,16 @@ fn bytes_hash(a: &Vec<u8>) -> u64 {
 // optional '-', digits only, no leading zeros unless the value is
 // exactly "0", "-0" rejected, range checked. Returns (ok, value).
 fn parse_i64_range(buf: &Vec<u8>, lo: u64, hi: u64) -> (bool, i64) {
+    // PANIC-32 fix (task 162): hi must not exceed the buffer
+    // length. A caller passing hi > len(buf) (truncated or
+    // corrupt input) would let the digit loop below read buf[p]
+    // past the end and trip the Vec-index panic (code 32,
+    // exit 160), killing the whole process. Treat it as
+    // truncated input and fail cleanly instead -- the callers
+    // already handle (false, 0) as a parse error.
+    if hi > len(buf) {
+        return (false, 0);
+    };
     if hi <= lo {
         return (false, 0);
     };
