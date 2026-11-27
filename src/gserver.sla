@@ -412,6 +412,13 @@ struct ConnJob {
     close_after_flush: bool,
     yield_ct: u64,
     auth_ok_pending: bool,
+    // sweep_from_raw reimplementation (task 134, Muse 18379):
+    // latched by g_conn_main as its last act before returning
+    // (normal exit). The sweep frees a dead slot's three boxes
+    // only once this is true (or goroutine_gone is set): a slot
+    // marked dead by a write error may still have a live
+    // goroutine, which must finish first (AUDIT section 4, path 1).
+    exited: bool,
 }
 
 struct ExecJob {
@@ -492,6 +499,13 @@ struct DriverConn {
     eof_sent: bool,
     close_after_flush: bool,
     dead: bool,
+    // sweep_from_raw reimplementation (task 134, Muse 18379):
+    // back-link to this connection's ConnJob (set at accept;
+    // the sweep reads it to free the job and its CmdReq) and
+    // the driver-observed "goroutine is gone" latch (set only
+    // on the supervisor-observed trap-exit path, CLOSE_NOW).
+    job: *ConnJob,
+    goroutine_gone: bool,
 }
 
 // Supervisor state (heap block, like every other goroutine's:
@@ -1450,6 +1464,9 @@ fn g_conn_main(job: *ConnJob) {
     while alive {
         alive = g_conn_step(job);
     }
+    // Last act before the goroutine returns: latch the exit so
+    // the driver sweep may free this job's three boxes.
+    (*job).exited = true;
 }
 
 // One connection cycle: wait for one inbox message (a data
@@ -2241,6 +2258,10 @@ fn g_io_drain_out(st: *IoSt) {
                     }
                 } else {
                     if (*m).kind == IO_OUT_CLOSE_NOW {
+                        // Supervisor-observed trap exit: the
+                        // goroutine is dead and will never touch
+                        // its job again; the sweep may free it.
+                        (*dc).goroutine_gone = true;
                         g_io_close(st, dc);
                     } else {
                         (*dc).close_after_flush = true;
@@ -2357,14 +2378,20 @@ fn g_io_accept(st: *IoSt) {
             accepts = accepts + 1;
         } else {
             let inbox: Chan<*IoMsg> = Chan::new(16);
-            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], rstage: [0u8; 65536], ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false }));
+            let dc = Box::into_raw(Box::new(DriverConn { fd: h, inbox: inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], rstage: [0u8; 65536], ready: 0, read_closed: false, eof_sent: false, close_after_flush: false, dead: false, job: (0 as ptr) as *ConnJob, goroutine_gone: false }));
+            // Copy of the pointer for the job link below: the
+            // store into slots moves , so the link is set
+            // through this copy once  exists (casts borrow,
+            // they do not move the source binding).
+            let dc_link = (dc as ptr) as *DriverConn;
             if (*st).n < 8192 {
                 (*st).slots[(*st).n] = dc;
                 (*st).n = (*st).n + 1;
             };
             let dchan: Chan<u64> = Chan::new(0);
             let req = Box::into_raw(Box::new(CmdReq { kind: CMD_BATCH, ack: true, batch: Vec::new(), replies: Vec::new(), done: dchan }));
-            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outsegs: Vec::new(), inl_args: Vec::new(), inl_ops: Vec::new(), inl_gens: Vec::new(), aof_dead: false, authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false }));
+            let cj = Box::into_raw(Box::new(ConnJob { ctx: ctx, auth_cfg: g_clone_auth((*ctx).auth), stream: h, req: req, inbox: inbox, inbuf: Vec::new(), inoff: 0, outsegs: Vec::new(), inl_args: Vec::new(), inl_ops: Vec::new(), inl_gens: Vec::new(), aof_dead: false, authed: false, close_after_flush: false, yield_ct: 0, auth_ok_pending: false, exited: false }));
+            (*dc_link).job = (cj as ptr) as *ConnJob;
             let gh = go g_conn_main(cj);
             (*ctx).sup_reg.send((gh, h));
             accepts = accepts + 1;
@@ -2497,7 +2524,7 @@ fn g_io_write(st: *IoSt, dc: *DriverConn) {
 fn g_io_run(job: *IoJob) -> i32 {
     let ctx = (*job).ctx;
     let dummy_inbox: Chan<*IoMsg> = Chan::new(1);
-    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], rstage: [0u8; 65536], ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true }));
+    let sentinel = Box::into_raw(Box::new(DriverConn { fd: 0, inbox: dummy_inbox, outq: Vec::new(), out_idx: 0, out_off: 0, stage: [0u8; 8192], rstage: [0u8; 65536], ready: 0, read_closed: true, eof_sent: true, close_after_flush: false, dead: true, job: (0 as ptr) as *ConnJob, goroutine_gone: false }));
     let st = Box::into_raw(Box::new(IoSt { ctx: ctx, listener: (*job).listener, wake_rx: (*job).wake_rx, slots: [sentinel; 8192], n: 0, lis_ready: 0, wake_ready: 0, any_dead: false }));
     while (*ctx).core_dead != true {
         g_io_drain_out(st);
@@ -2531,18 +2558,45 @@ fn g_io_run(job: *IoJob) -> i32 {
             }
         };
         if (*st).any_dead {
-            // swap-remove the dead slots (pointer moves only;
-            // order in the table carries no semantics)
+            // sweep_from_raw (task 134, Muse 18379; R1421):
+            // a dead slot's three boxes (DriverConn, ConnJob,
+            // CmdReq) are returned with Box::from_raw + drop --
+            // but only once the connection goroutine is known
+            // gone: either it latched `exited` as its last act,
+            // or the driver observed its trap exit
+            // (goroutine_gone). A slot whose goroutine is
+            // still alive (write-error close, AUDIT section 4
+            // path 1) stays in the table and is retried on a
+            // later sweep; any_dead stays set until nothing is
+            // left deferred. The sentinel never enters this scan
+            // (only slots [0, n) are visited).
             let ki: u64 = 0;
+            let deferred: bool = false;
             while ki < (*st).n {
                 if (*(*st).slots[ki]).dead {
-                    (*st).n = (*st).n - 1;
-                    (*st).slots[ki] = (*st).slots[(*st).n];
+                    let dc = (*st).slots[ki];
+                    let job = (*dc).job;
+                    if (*job).exited || (*dc).goroutine_gone {
+                        let req = (*job).req;
+                        let dc_box = unsafe { Box::from_raw(dc) };
+                        let cj_box = unsafe { Box::from_raw(job) };
+                        let req_box = unsafe { Box::from_raw(req) };
+                        !dc_box;
+                        !cj_box;
+                        !req_box;
+                        (*st).n = (*st).n - 1;
+                        (*st).slots[ki] = (*st).slots[(*st).n];
+                    } else {
+                        deferred = true;
+                        ki = ki + 1;
+                    };
                 } else {
                     ki = ki + 1;
                 };
             }
-            (*st).any_dead = false;
+            if deferred != true {
+                (*st).any_dead = false;
+            };
         };
     }
     return G_EXIT_CORE_DEAD;
