@@ -81,20 +81,25 @@ fn resp_parse(buf: &Vec<u8>, start: u64) -> ParseResult {
         let k: i64 = 0;
         while k < n {
             if pos >= len(buf) {
+                args = Vec::new();
                 return parse_result(PARSE_INCOMPLETE, 0);
             };
             if buf[pos] != 36 {
+                args = Vec::new();
                 return parse_result(PARSE_ERROR, 0);
             };
             let (f2, c2, n2) = find_line(buf, pos + 1);
             if f2 != true {
+                args = Vec::new();
                 return parse_result(PARSE_INCOMPLETE, 0);
             };
             let (ok2, blen) = parse_i64_range(buf, pos + 1, c2);
             if ok2 != true {
+                args = Vec::new();
                 return parse_result(PARSE_ERROR, 0);
             };
             if blen < -1 {
+                args = Vec::new();
                 return parse_result(PARSE_ERROR, 0);
             };
             if blen == -1 {
@@ -103,16 +108,20 @@ fn resp_parse(buf: &Vec<u8>, start: u64) -> ParseResult {
             } else {
                 let blen_u: u64 = blen as u64;
                 if blen_u > RESP_MAX_BULK {
+                    args = Vec::new();
                     return parse_result(PARSE_ERROR, 0);
                 };
                 // need the payload plus its trailing CRLF
                 if len(buf) - n2 < blen_u + 2 {
+                    args = Vec::new();
                     return parse_result(PARSE_INCOMPLETE, 0);
                 };
                 if buf[n2 + blen_u] != 13 {
+                    args = Vec::new();
                     return parse_result(PARSE_ERROR, 0);
                 };
                 if buf[n2 + blen_u + 1] != 10 {
+                    args = Vec::new();
                     return parse_result(PARSE_ERROR, 0);
                 };
                 let arg: Vec<u8> = Vec::new();
